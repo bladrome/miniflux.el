@@ -1,0 +1,159 @@
+#+title: miniflux.el — Miniflux RSS client for Emacs (via elfeed)
+#+author: bladrome
+#+language: en
+
+* Overview
+
+=miniflux.el= is an Emacs package that turns [[https://miniflux.app][Miniflux]] into a first-class
+RSS reader inside Emacs.  It fetches entries from your Miniflux server
+and stores them in [[https://github.com/skeeto/elfeed][elfeed]]'s local database, so you get the full
+elfeed UI (search, filtering, entry display) with bidirectional sync
+of read/unread and starred status.
+
+** Key features
+
+- *Full elfeed integration* — entries live in elfeed's database and use
+  its familiar search-mode interface.
+- *Bidirectional sync* — read/unread and star/bookmark states are
+  pushed back to the Miniflux server whenever you change them in
+  elfeed.
+- *API token or HTTP Basic Auth* — supports both authentication methods
+  natively.
+- *Category tags* — Miniflux categories are automatically imported as
+  elfeed tags.
+- *No external dependencies* — only relies on built-in =url.el= and
+  =elfeed= (installed automatically if missing).
+
+* Installation
+
+** straight.el (recommended)
+
+#+begin_src emacs-lisp
+(straight-use-package
+ '(miniflux :type git :host github :repo "bladrome/miniflux.el"))
+#+end_src
+
+** use-package + straight
+
+#+begin_src emacs-lisp
+(use-package miniflux
+  :straight (miniflux :type git :host github :repo "bladrome/miniflux.el")
+  :config
+  (setq miniflux-server "https://your-miniflux.example.com")
+  (setq miniflux-token "your-api-token"))
+#+end_src
+
+** Manual
+
+Add =miniflux.el= to your =load-path= and:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/miniflux.el")
+(require 'miniflux)
+#+end_src
+
+* Configuration
+
+| Variable               | Default               | Description                                    |
+|------------------------+-----------------------+------------------------------------------------|
+| =miniflux-server=        | ="https://example.com"= | Base URL of your Miniflux instance             |
+| =miniflux-token=         | =""=                    | API token (preferred auth method)              |
+| =miniflux-username=      | =""=                    | Username for HTTP Basic Auth                   |
+| =miniflux-password=      | =""=                    | Password for HTTP Basic Auth                   |
+| =miniflux-sync-limit=    | =200=                   | Max entries fetched per sync batch             |
+| =miniflux-sync-star-tag= | =star=                  | elfeed tag used for starred/bookmarked entries |
+
+** Example (API token)
+
+#+begin_src emacs-lisp
+(setq miniflux-server "https://miniflux.mydomain.com")
+(setq miniflux-token "my-secret-api-token")
+#+end_src
+
+** Example (username + password)
+
+#+begin_src emacs-lisp
+(setq miniflux-server "https://miniflux.mydomain.com")
+(setq miniflux-username "admin")
+(setq miniflux-password "s3cret")
+#+end_src
+
+* Usage
+
+** Interactive commands
+
+| Command           | Description                                    |
+|-------------------+------------------------------------------------|
+| =M-x miniflux=      | Sync from server and open elfeed search buffer |
+| =M-x miniflux-sync= | Sync only (background); does not open elfeed   |
+
+** Keybindings in elfeed-search-mode
+
+| Key | Action                                                          |
+|-----+-----------------------------------------------------------------|
+| =G=   | Sync from Miniflux server and refresh (=miniflux-search-refresh=) |
+| =r=   | Sync + refresh (evil/Doom users, normal state)                  |
+
+Standard elfeed keybindings continue to work and automatically sync
+back to Miniflux:
+
+| Key | Action                                              |
+|-----+-----------------------------------------------------|
+| =s=   | Mark selected entries as read (syncs to Miniflux)   |
+| =u=   | Mark selected entries as unread (syncs to Miniflux) |
+| =+=   | Add a tag (e.g. =+ star= to sync star to Miniflux)    |
+| -=  | Remove a tag (e.g. =- star= to unstar on Miniflux)    |
+
+** How sync works
+
+=miniflux-sync= performs the following steps:
+
+1. Fetches /unread/, /starred/, and /recent/ entries from the Miniflux
+   API (up to =miniflux-sync-limit= per batch).
+2. Converts them to elfeed entries and writes them into the local
+   elfeed database.
+3. Compares local elfeed tags with server-side status and pushes any
+   differences (read/unread, star/unstar) back to Miniflux.
+
+* API wrapper
+
+The package also exposes a general-purpose Miniflux API client that
+you can use in your own Elisp code:
+
+#+begin_src emacs-lisp
+;; List all feeds
+(miniflux-get-feeds)
+
+;; Get entries for a specific feed
+(miniflux-get-feed-entries 42 :limit 50 :status "unread")
+
+;; Get all entries with filters
+(miniflux-get-entries :limit 100 :status "unread" :starred "1")
+
+;; Mark entries as read / unread
+(miniflux-update-entry-status '(10 20 30) "read")
+
+;; Toggle bookmark (star)
+(miniflux-toggle-entry-bookmark 10)
+
+;; Refresh feeds on the server
+(miniflux-refresh-all-feeds)
+(miniflux-refresh-feed 42)
+
+;; Mark all entries in a feed or category as read
+(miniflux-mark-feed-as-read 42)
+(miniflux-mark-category-as-read 5)
+
+;; List categories
+(miniflux-get-categories)
+#+end_src
+
+* Compatibility
+
+- Emacs 27+ (tested on Emacs 29)
+- Requires [[https://github.com/skeeto/elfeed][elfeed]] (installed automatically if not present)
+- Works with [[https://github.com/emacs-evil/evil][evil-mode]] keybindings in elfeed-search-mode
+
+* License
+
+This package is distributed under the same terms as Emacs itself (GPLv3 or later).  See the header of =miniflux.el= for details.

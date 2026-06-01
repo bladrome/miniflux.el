@@ -29,6 +29,11 @@
 (require 'parse-time)
 (require 'url)
 
+(eval-when-compile
+  (unless (require 'elfeed nil t)
+    (package-initialize)
+    (require 'elfeed)))
+
 (unless (require 'elfeed nil t)
   (package-initialize)
   (require 'elfeed))

@@ -660,8 +660,7 @@ NOT push — it only pulls from server."
     (define-key elfeed-search-mode-map "G" #'miniflux-search-refresh)
     (when (fboundp 'evil-define-key)
       (evil-define-key 'normal elfeed-search-mode-map
-        "G" #'miniflux-search-refresh
-        "r" #'miniflux-search-refresh))))
+        "G" #'miniflux-search-refresh))))
 
 (miniflux--setup-keybindings)
 

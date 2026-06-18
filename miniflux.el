@@ -427,18 +427,51 @@ Therefore elfeed's tag hooks are NOT triggered and no API calls are made."
      elfeed-db-entries)
     changed))
 
+(defun miniflux--reconcile-all-unread (api-unread-ids complete-p)
+  "Reconcile unread tags for ALL local miniflux entries against the API.
+API-UNREAD-IDS is a hash table keyed by entry-id (cons) for entries
+that are unread on the server.  COMPLETE-P is non-nil when the unread
+batch was not full, meaning api-unread-ids is the complete set of
+unread entries on the server.
+
+When COMPLETE-P: iterates ALL local miniflux entries and forces the
+unread tag to match the server.  When NOT COMPLETE-P: only adds
+unread tags (entries in api-unread-ids that lack it locally) but does
+not remove them (to avoid false negatives from incomplete batches).
+
+Uses (setf elfeed-entry-tags) → no elfeed hooks are triggered."
+  (let ((changed 0))
+    (maphash
+     (lambda (id entry)
+       (when (and (consp id) (eq (car id) 'miniflux))
+         (let* ((tags (elfeed-entry-tags entry))
+                (has-unread (memq 'unread tags))
+                (should-unread (gethash id api-unread-ids)))
+           (cond
+            ;; API doesn't have unread, local does → remove (only if batch complete)
+            ((and has-unread (not should-unread) complete-p)
+             (setf (elfeed-entry-tags entry)
+                   (delq 'unread tags))
+             (setq changed (1+ changed)))
+            ;; API has unread, local doesn't → add
+            ((and should-unread (not has-unread))
+             (setf (elfeed-entry-tags entry)
+                   (cons 'unread tags))
+             (setq changed (1+ changed)))))))
+     elfeed-db-entries)
+    changed))
+
 (defun miniflux--reconcile-entry-tags (api-table)
-  "Reconcile unread and category tags for entries present in API-TABLE.
+  "Reconcile category tags for entries present in API-TABLE.
 API-TABLE maps entry-id (cons) to raw API entry alist.  For each entry
-that exists locally, force unread and category tags to match the API
-state.  Star reconciliation is handled separately by
-`miniflux--reconcile-all-stars' which covers ALL local entries.
+that exists locally, force category tags to match the API state.
+Star reconciliation is handled by `miniflux--reconcile-all-stars'.
+Unread reconciliation is handled by `miniflux--reconcile-all-unread'.
 
 Uses direct (setf elfeed-entry-tags) → no elfeed hooks are triggered."
   (maphash
    (lambda (id api-entry)
-     (let* ((api-unread (equal (assoc-default 'status api-entry) "unread"))
-            (api-cat (miniflux--entry-category-tag api-entry))
+     (let* ((api-cat (miniflux--entry-category-tag api-entry))
             (e (gethash id elfeed-db-entries)))
        (when e
          ;; Fix titles with newlines
@@ -446,14 +479,12 @@ Uses direct (setf elfeed-entry-tags) → no elfeed hooks are triggered."
            (when (string-match-p "[\n\r]" title)
              (setf (elfeed-entry-title e)
                    (replace-regexp-in-string "[\n\r]+" " " title))))
-         ;; Reconcile unread and category tags to match API state
-         (let ((tags (elfeed-entry-tags e)))
-           ;; Unread tag
-           (when (and api-unread (not (memq 'unread tags)))
-             (push 'unread tags))
-           (when (and (not api-unread) (memq 'unread tags))
-             (setq tags (delq 'unread tags)))
-           ;; Category tag
+         ;; Reconcile category tags to match API state
+         (let* ((tags (elfeed-entry-tags e))
+                (tags (cl-loop for tag in tags
+                               when (or (memq tag '(unread star))
+                                        (eq tag api-cat))
+                               collect tag)))
            (when (and api-cat (not (memq api-cat tags)))
              (push api-cat tags))
            (setf (elfeed-entry-tags e) tags)))))
@@ -470,13 +501,13 @@ Flow:
   1. Fetch starred, unread, and recent entries from the API.
   2. Add/update them in elfeed DB (elfeed-db-add preserves local tags
      for existing entries; reconciliation fixes them in step 4).
-  3. Build api-starred-ids: the complete set of starred entry IDs.
+  3. Build api-starred-ids and api-unread-ids hash tables.
   4. Star reconciliation: iterate over ALL local miniflux entries
-     and force star tags to match api-starred-ids.  This covers entries
-     that exist locally but weren't in any API batch (read+unstarred+old).
-  5. Unread/category reconciliation: for entries in api-table, sync
-     unread and category tags.
-  6. Save."
+     and force star tags to match api-starred-ids.
+  5. Unread reconciliation: iterate over ALL local miniflux entries
+     and force unread tags to match api-unread-ids.
+  6. Category reconciliation: for entries in api-table, sync category tags.
+  7. Save."
   (interactive)
   (miniflux--check-auth)
   (miniflux--ensure-elfeed)
@@ -484,36 +515,64 @@ Flow:
   (when miniflux--sync-in-progress
     (user-error "Sync already in progress"))
   (let ((miniflux--sync-in-progress t))
-    (message "Miniflux: syncing...")
-    (let ((api-table (make-hash-table :test 'equal))
-          (api-starred-ids (make-hash-table :test 'equal))
-          (total-entries 0))
-      ;; Phase 1: Fetch from API and add to elfeed DB.
-      ;; Starred batch first → builds the authoritative starred ID set.
-      (dolist (batch (list (list :limit miniflux-sync-limit :starred "1")
-                           (list :limit miniflux-sync-limit :status "unread")
-                           (list :limit miniflux-sync-limit :order "published_at")))
-        (let ((raw (miniflux--fetch-and-store batch)))
-          (when raw
-            (setq total-entries (+ total-entries (length raw)))
-            (dolist (e (append raw nil))
-              (let ((id (cons 'miniflux (format "%d" (assoc-default 'id e)))))
-                (puthash id e api-table)
-                (when (eq t (assoc-default 'starred e))
-                  (puthash id t api-starred-ids)))))))
-      ;; Phase 2: Reconcile star tags for ALL local miniflux entries.
-      ;; This is the critical step — it iterates elfeed-db-entries (not
-      ;; just api-table) so even entries not in any API batch get their
-      ;; star corrected.  api-starred-ids is the authoritative reference.
-      (let ((star-changes (miniflux--reconcile-all-stars api-starred-ids)))
-        (when (> star-changes 0)
-          (message "Miniflux: reconciled %d star tag(s)" star-changes)))
-      ;; Phase 3: Reconcile unread/category tags for API-fetched entries.
-      (miniflux--reconcile-entry-tags api-table)
-      (elfeed-db-save)
-      (if (> total-entries 0)
-          (message "Miniflux: synced %d entries" total-entries)
-        (message "Miniflux: no entries found (check server/credentials)")))))
+    (unwind-protect
+        (progn
+          (message "Miniflux: syncing...")
+          (let ((api-table (make-hash-table :test 'equal))
+                (api-starred-ids (make-hash-table :test 'equal))
+                (api-unread-ids (make-hash-table :test 'equal))
+                (unread-batch-complete t)
+                (total-entries 0))
+            ;; Phase 1: Fetch starred and recent entries from API.
+            (dolist (batch (list (list :limit miniflux-sync-limit :starred "1")
+                                 (list :limit miniflux-sync-limit :order "published_at")))
+              (let ((raw (miniflux--fetch-and-store batch)))
+                (when raw
+                  (setq total-entries (+ total-entries (length raw)))
+                  (dolist (e (append raw nil))
+                    (let ((id (cons 'miniflux (format "%d" (assoc-default 'id e)))))
+                      (puthash id e api-table)
+                      (when (eq t (assoc-default 'starred e))
+                        (puthash id t api-starred-ids))
+                      (when (equal (assoc-default 'status e) "unread")
+                        (puthash id t api-unread-ids)))))))
+            ;; Phase 1b: Fetch unread entries separately to track batch completeness.
+            (let ((unread-data (miniflux--request :GET "/entries"
+                                                  nil
+                                                  (list (cons "limit" (number-to-string miniflux-sync-limit))
+                                                        (cons "status" "unread")))))
+              (when unread-data
+                (let ((entries (assoc-default 'entries unread-data))
+                      (total (assoc-default 'total unread-data)))
+                  ;; Check if batch is complete (total <= limit means we have all unread entries)
+                  (when (and total (>= total miniflux-sync-limit))
+                    (setq unread-batch-complete nil))
+                  ;; Add unread entries to elfeed DB and build api-unread-ids
+                  (when entries
+                    (miniflux--convert-entries entries)
+                    (setq total-entries (+ total-entries (length entries)))
+                    (dolist (e (append entries nil))
+                      (let ((id (cons 'miniflux (format "%d" (assoc-default 'id e)))))
+                        (puthash id e api-table)
+                        (puthash id t api-unread-ids)
+                        (when (eq t (assoc-default 'starred e))
+                          (puthash id t api-starred-ids))))))))
+            ;; Phase 2: Reconcile star tags for ALL local miniflux entries.
+            (let ((star-changes (miniflux--reconcile-all-stars api-starred-ids)))
+              (when (> star-changes 0)
+                (message "Miniflux: reconciled %d star tag(s)" star-changes)))
+            ;; Phase 3: Reconcile unread tags for ALL local miniflux entries.
+            (let ((unread-changes (miniflux--reconcile-all-unread
+                                   api-unread-ids unread-batch-complete)))
+              (when (> unread-changes 0)
+                (message "Miniflux: reconciled %d unread tag(s)" unread-changes)))
+            ;; Phase 4: Reconcile category tags for API-fetched entries.
+            (miniflux--reconcile-entry-tags api-table)
+            (elfeed-db-save)
+            (if (> total-entries 0)
+                (message "Miniflux: synced %d entries" total-entries)
+              (message "Miniflux: no entries found (check server/credentials)"))))
+      (setq miniflux--sync-in-progress nil))))
 
 (defun miniflux--entry-mf-id (entry)
   "Get the Miniflux numeric ID from an elfeed ENTRY, or nil."
@@ -536,30 +595,38 @@ Flow:
 Called via `elfeed-tag-hook' when the user adds tags (e.g. + star).
 This is the ONLY mechanism for local→server star pushes.  Sync does
 NOT push — it only pulls from server."
-  (when (memq 'unread tags)
-    (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
-      (when ids
-        (miniflux-update-entry-status ids "unread"))))
-  (when (memq miniflux-sync-star-tag tags)
-    (dolist (entry entries)
-      (let ((mf-id (miniflux--entry-mf-id entry)))
-        (when mf-id
-          (miniflux-toggle-entry-bookmark mf-id))))))
+  (condition-case err
+      (progn
+        (when (memq 'unread tags)
+          (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
+            (when ids
+              (miniflux-update-entry-status ids "unread"))))
+        (when (memq miniflux-sync-star-tag tags)
+          (dolist (entry entries)
+            (let ((mf-id (miniflux--entry-mf-id entry)))
+              (when mf-id
+                (miniflux-toggle-entry-bookmark mf-id))))))
+    (error
+     (message "Miniflux tag-hook error: %s" (error-message-string err)))))
 
 (defun miniflux--untag-hook (entries tags)
   "Push tag removals from elfeed to Miniflux in real-time.
 Called via `elfeed-untag-hook' when the user removes tags (e.g. - star).
 This is the ONLY mechanism for local→server star pushes.  Sync does
 NOT push — it only pulls from server."
-  (when (memq 'unread tags)
-    (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
-      (when ids
-        (miniflux-update-entry-status ids "read"))))
-  (when (memq miniflux-sync-star-tag tags)
-    (dolist (entry entries)
-      (let ((mf-id (miniflux--entry-mf-id entry)))
-        (when mf-id
-          (miniflux-toggle-entry-bookmark mf-id))))))
+  (condition-case err
+      (progn
+        (when (memq 'unread tags)
+          (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
+            (when ids
+              (miniflux-update-entry-status ids "read"))))
+        (when (memq miniflux-sync-star-tag tags)
+          (dolist (entry entries)
+            (let ((mf-id (miniflux--entry-mf-id entry)))
+              (when mf-id
+                (miniflux-toggle-entry-bookmark mf-id))))))
+    (error
+     (message "Miniflux untag-hook error: %s" (error-message-string err)))))
 
 ;;; ─── Install hooks and keybindings ───
 

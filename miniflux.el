@@ -175,8 +175,8 @@ Returns parsed JSON on success, t for 204, nil on error."
                      (status (miniflux--http-status)))
                 (cond
                  ((null body-start) nil)
-                 ((and status (>= status 400))
-                  (message "Miniflux HTTP %d" status)
+                 ((or (null status) (>= status 400))
+                  (when status (message "Miniflux HTTP %d" status))
                   nil)
                  ((= status 204) t)
                  (t

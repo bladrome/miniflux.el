@@ -20,9 +20,24 @@
     (should (equal (miniflux--auth-headers)
                    '(("X-Auth-Token" . "token"))))))
 
+(ert-deftest miniflux-request-url-encodes-params ()
+  (let ((miniflux-server "https://example.com"))
+    (should (equal (miniflux--request-url "/entries" '(("status" . "unread")
+                                                        ("search" . "foo bar")))
+                   "https://example.com/v1/entries?status=unread&search=foo%20bar"))))
+
+(ert-deftest miniflux-json-error-message-extracts-message ()
+  (should (equal (miniflux--json-error-message "{\"error_message\":\"bad token\"}")
+                 "bad token")))
+
+(ert-deftest miniflux-slugify-trims-dashes ()
+  (should (equal (miniflux--slugify "  Tech & News!  ") "tech-news")))
+
 (ert-deftest miniflux-entry-category-tag-normalizes-title ()
-  (let ((entry '((feed . ((category . ((title . "Tech News"))))))))
-    (should (eq (miniflux--entry-category-tag entry) 'tech-news))))
+  (let ((entry '((feed . ((category . ((title . "Tech News")))))))
+        (miniflux-category-tag-prefix "miniflux-category-"))
+    (should (eq (miniflux--entry-category-tag entry)
+                'miniflux-category-tech-news))))
 
 (ert-deftest miniflux-reconcile-all-stars-uses-custom-star-tag ()
   (let* ((miniflux-sync-star-tag 'favorite)
@@ -32,9 +47,18 @@
          (entry (elfeed-entry--create :id id :title "t" :tags '(unread))))
     (puthash id entry elfeed-db-entries)
     (puthash id t api-starred-ids)
-    (should (= (miniflux--reconcile-all-stars api-starred-ids) 1))
+    (should (= (miniflux--reconcile-all-stars api-starred-ids t) 1))
     (should (memq 'favorite (elfeed-entry-tags entry)))
     (should-not (memq 'star (elfeed-entry-tags entry)))))
+
+(ert-deftest miniflux-reconcile-stars-incomplete-batch-does-not-remove ()
+  (let* ((elfeed-db-entries (make-hash-table :test 'equal))
+         (api-starred-ids (make-hash-table :test 'equal))
+         (id (cons 'miniflux "1"))
+         (entry (elfeed-entry--create :id id :title "t" :tags '(star))))
+    (puthash id entry elfeed-db-entries)
+    (should (= (miniflux--reconcile-all-stars api-starred-ids nil) 0))
+    (should (memq 'star (elfeed-entry-tags entry)))))
 
 (ert-deftest miniflux-reconcile-unread-incomplete-batch-does-not-remove ()
   (let* ((elfeed-db-entries (make-hash-table :test 'equal))
@@ -45,6 +69,15 @@
     (should (= (miniflux--reconcile-all-unread api-unread-ids nil) 0))
     (should (memq 'unread (elfeed-entry-tags entry)))))
 
+(ert-deftest miniflux-reconcile-unread-complete-batch-removes-missing ()
+  (let* ((elfeed-db-entries (make-hash-table :test 'equal))
+         (api-unread-ids (make-hash-table :test 'equal))
+         (id (cons 'miniflux "1"))
+         (entry (elfeed-entry--create :id id :title "t" :tags '(unread))))
+    (puthash id entry elfeed-db-entries)
+    (should (= (miniflux--reconcile-all-unread api-unread-ids t) 1))
+    (should-not (memq 'unread (elfeed-entry-tags entry)))))
+
 (ert-deftest miniflux-reconcile-entry-tags-preserves-user-tags ()
   (let* ((elfeed-db-entries (make-hash-table :test 'equal))
          (api-table (make-hash-table :test 'equal))
@@ -53,12 +86,31 @@
                                       :title "multi\nline"
                                       :tags '(unread favorite custom))))
     (puthash id entry elfeed-db-entries)
-    (puthash id '((feed . ((category . ((title . "Tech News")))))) api-table)
+    (puthash id '((id . 1)
+                  (author . "Ada")
+                  (feed . ((id . 2)
+                           (category . ((id . 3) (title . "Tech News")))))) api-table)
     (miniflux--reconcile-entry-tags api-table)
     (should (equal (elfeed-entry-title entry) "multi line"))
     (should (memq 'unread (elfeed-entry-tags entry)))
     (should (memq 'favorite (elfeed-entry-tags entry)))
     (should (memq 'custom (elfeed-entry-tags entry)))
-    (should (memq 'tech-news (elfeed-entry-tags entry)))))
+    (should (memq 'miniflux-category-tech-news (elfeed-entry-tags entry)))
+    (should (equal (plist-get (elfeed-entry-meta entry) :miniflux-category-title)
+                   "Tech News"))))
+
+(ert-deftest miniflux-reconcile-entry-tags-removes-stale-category-tags ()
+  (let* ((elfeed-db-entries (make-hash-table :test 'equal))
+         (api-table (make-hash-table :test 'equal))
+         (id (cons 'miniflux "1"))
+         (entry (elfeed-entry--create :id id
+                                      :title "t"
+                                      :tags '(miniflux-category-old custom))))
+    (puthash id entry elfeed-db-entries)
+    (puthash id '((feed . ((category . ((title . "New")))))) api-table)
+    (miniflux--reconcile-entry-tags api-table)
+    (should-not (memq 'miniflux-category-old (elfeed-entry-tags entry)))
+    (should (memq 'custom (elfeed-entry-tags entry)))
+    (should (memq 'miniflux-category-new (elfeed-entry-tags entry)))))
 
 ;;; miniflux-test.el ends here

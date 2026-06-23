@@ -32,6 +32,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'browse-url)
 (require 'gv)
 (require 'json)
 (require 'parse-time)
@@ -41,6 +42,7 @@
 
 (declare-function elfeed-search "elfeed")
 (declare-function elfeed-search-buffer "elfeed-search")
+(declare-function elfeed-search-selected "elfeed-search")
 (declare-function elfeed-search-set-filter "elfeed-search")
 (declare-function elfeed-search-update "elfeed-search")
 (declare-function elfeed-db-add "elfeed-db")
@@ -76,11 +78,18 @@
   "Set elfeed ENTRY title slot to TITLE."
   (aset entry 2 title))
 
+(defun miniflux--set-entry-meta (entry meta)
+  "Set elfeed ENTRY meta slot to META."
+  (aset entry 10 meta))
+
 (gv-define-setter elfeed-entry-tags (val entry)
   `(miniflux--set-entry-tags ,entry ,val))
 
 (gv-define-setter elfeed-entry-title (val entry)
   `(miniflux--set-entry-title ,entry ,val))
+
+(gv-define-setter elfeed-entry-meta (val entry)
+  `(miniflux--set-entry-meta ,entry ,val))
 
 ;;; ─── Customization ───
 
@@ -120,8 +129,55 @@ See https://miniflux.app/docs/api.html#authentication."
   :type '(symbol)
   :group 'miniflux)
 
+(defcustom miniflux-sync-failed-tag 'miniflux-sync-failed
+  "Tag added to entries when a local change fails to push to Miniflux."
+  :type '(symbol)
+  :group 'miniflux)
+
+(defcustom miniflux-sync-full-unread t
+  "Non-nil means fetch all unread pages during sync."
+  :type '(boolean)
+  :group 'miniflux)
+
+(defcustom miniflux-sync-full-starred t
+  "Non-nil means fetch all starred pages during sync."
+  :type '(boolean)
+  :group 'miniflux)
+
+(defcustom miniflux-sync-pages-limit 20
+  "Maximum number of pages to fetch for each paginated sync query."
+  :type '(integer)
+  :group 'miniflux)
+
+(defcustom miniflux-sync-incremental t
+  "Non-nil means fetch recent entries changed since the last successful sync.
+This only affects the recent batch.  Unread and starred reconciliation
+still uses their dedicated queries."
+  :type '(boolean)
+  :group 'miniflux)
+
+(defcustom miniflux-category-tag-prefix "miniflux-category-"
+  "Prefix used for Miniflux category tags in elfeed.
+Using a namespace lets sync replace stale category tags without touching
+unrelated user tags."
+  :type '(string)
+  :group 'miniflux)
+
+(defcustom miniflux-web-entry-path "/unread/entry/%d"
+  "Format string for opening an entry in the Miniflux web interface."
+  :type '(string)
+  :group 'miniflux)
+
+(defcustom miniflux-web-feed-path "/feeds/%d/entries"
+  "Format string for opening a feed in the Miniflux web interface."
+  :type '(string)
+  :group 'miniflux)
+
 (defvar miniflux--sync-in-progress nil
   "Non-nil when a sync is running.")
+
+(defvar miniflux-last-sync-time nil
+  "Unix timestamp of the last successful Miniflux sync.")
 
 ;;; ─── HTTP ───
 
@@ -155,6 +211,64 @@ See https://miniflux.app/docs/api.html#authentication."
     (or (and (search-forward "\r\n\r\n" nil t) (point))
         (and (search-forward "\n\n" nil t) (point)))))
 
+(defun miniflux--decode-body (body-start)
+  "Return decoded response body from BODY-START to buffer end."
+  (decode-coding-string
+   (string-to-unibyte
+    (buffer-substring-no-properties body-start (point-max)))
+   'utf-8))
+
+(defun miniflux--json-error-message (body)
+  "Extract a useful error message from JSON BODY, or nil."
+  (condition-case nil
+      (let ((data (json-read-from-string body)))
+        (or (assoc-default 'error_message data)
+            (assoc-default 'message data)
+            (assoc-default 'error data)))
+    (error nil)))
+
+(defun miniflux--request-url (path params)
+  "Build full request URL for PATH and PARAMS."
+  (let ((url (miniflux--api-url path)))
+    (if params
+        (concat url "?" (mapconcat
+                         (lambda (p)
+                           (format "%s=%s"
+                                   (url-hexify-string (car p))
+                                   (url-hexify-string (cdr p))))
+                         params "&"))
+      url)))
+
+(defun miniflux--prepare-request (method data)
+  "Set url.el dynamic request variables for METHOD and DATA."
+  (setq url-request-method (format "%s" (substring (symbol-name method) 1))
+        url-request-extra-headers (miniflux--auth-headers)
+        url-request-data nil)
+  (when (member method '(:POST :PUT))
+    (push '("Content-Type" . "application/json") url-request-extra-headers)
+    (when data
+      (setq url-request-data (encode-coding-string (json-encode data) 'utf-8)))))
+
+(defun miniflux--parse-response ()
+  "Parse the current url.el response buffer."
+  (let* ((body-start (miniflux--http-body))
+         (status (miniflux--http-status)))
+    (cond
+     ((null body-start)
+      (message "Miniflux: empty HTTP response")
+      nil)
+     ((or (null status) (>= status 400))
+      (let* ((body (miniflux--decode-body body-start))
+             (api-message (miniflux--json-error-message body)))
+        (message "Miniflux HTTP %s%s"
+                 (or status "?")
+                 (if api-message (format ": %s" api-message) ""))
+        nil))
+     ((= status 204) t)
+     (t
+      (let ((body (miniflux--decode-body body-start)))
+        (json-read-from-string body))))))
+
 (defun miniflux--request (method path &optional data params)
   "Make a synchronous HTTP request to the Miniflux API.
 METHOD: :GET :PUT :POST :DELETE.
@@ -162,42 +276,43 @@ PATH: API path (without /v1).
 DATA: alist for JSON body.
 PARAMS: alist for query string.
 Returns parsed JSON on success, t for 204, nil on error."
-  (let ((url-request-method (format "%s" (substring (symbol-name method) 1)))
-        (url-request-extra-headers (miniflux--auth-headers))
-        (url-request-data nil)
-        (url (miniflux--api-url path)))
-    (when (member method '(:POST :PUT))
-      (push '("Content-Type" . "application/json") url-request-extra-headers)
-      (when data
-        (setq url-request-data (encode-coding-string (json-encode data) 'utf-8))))
-    (when params
-      (setq url (concat url "?" (mapconcat
-                                 (lambda (p)
-                                   (format "%s=%s"
-                                           (url-hexify-string (car p))
-                                           (url-hexify-string (cdr p))))
-                                 params "&"))))
+  (let ((url (miniflux--request-url path params))
+        (url-request-method nil)
+        (url-request-extra-headers nil)
+        (url-request-data nil))
     (condition-case err
-        (with-current-buffer (url-retrieve-synchronously url)
-          (prog1
-              (let* ((body-start (miniflux--http-body))
-                     (status (miniflux--http-status)))
-                (cond
-                 ((null body-start) nil)
-                 ((or (null status) (>= status 400))
-                  (when status (message "Miniflux HTTP %d" status))
-                  nil)
-                 ((= status 204) t)
-                 (t
-                  (let ((body (decode-coding-string
-                               (string-to-unibyte
-                                (buffer-substring-no-properties body-start (point-max)))
-                               'utf-8)))
-                     (json-read-from-string body)))))
-            (kill-buffer (current-buffer))))
+        (progn
+          (miniflux--prepare-request method data)
+          (with-current-buffer (url-retrieve-synchronously url)
+            (prog1
+                (miniflux--parse-response)
+              (kill-buffer (current-buffer)))))
       (error
        (message "Miniflux error: %S" (error-message-string err))
        nil))))
+
+(defun miniflux--request-async (method path callback &optional data params)
+  "Make an asynchronous HTTP request and call CALLBACK with parsed JSON."
+  (let ((url (miniflux--request-url path params))
+        (url-request-method nil)
+        (url-request-extra-headers nil)
+        (url-request-data nil))
+    (miniflux--prepare-request method data)
+    (url-retrieve
+     url
+     (lambda (status)
+       (unwind-protect
+           (funcall callback
+                    (if (plist-get status :error)
+                        (progn
+                          (message "Miniflux async error: %S" (plist-get status :error))
+                          nil)
+                      (condition-case err
+                          (miniflux--parse-response)
+                        (error
+                         (message "Miniflux async parse error: %s" (error-message-string err))
+                         nil))))
+         (kill-buffer (current-buffer)))))))
 
 ;;; ─── API: Feeds ───
 
@@ -224,6 +339,52 @@ Returns parsed JSON on success, t for 204, nil on error."
       (let ((key (pop filters)) (val (pop filters)))
         (push (cons (substring (symbol-name key) 1) (format "%s" val)) params)))
     (miniflux--request :GET "/entries" nil params)))
+
+(defun miniflux--filters-to-params (filters)
+  "Convert FILTERS plist to API query params."
+  (let (params)
+    (while filters
+      (let ((key (pop filters))
+            (val (pop filters)))
+        (when val
+          (push (cons (substring (symbol-name key) 1) (format "%s" val)) params))))
+    (nreverse params)))
+
+(defun miniflux--fetch-entry-pages (filters full-p)
+  "Fetch entry pages matching FILTERS.
+When FULL-P is non-nil, continue until the API total is exhausted or
+`miniflux-sync-pages-limit' is reached.  Return (ENTRIES COMPLETE-P TOTAL OK-P)."
+  (let ((offset 0)
+        (page 0)
+        (entries nil)
+        (total nil)
+        (complete-p nil)
+        (ok-p nil)
+        data page-entries)
+    (while (and (or (= page 0)
+                    (and full-p total (< (length entries) total)))
+                (< page miniflux-sync-pages-limit))
+      (setq data (miniflux--request
+                  :GET "/entries" nil
+                  (miniflux--filters-to-params
+                   (append filters (list :limit miniflux-sync-limit
+                                         :offset offset)))))
+      (setq page (1+ page))
+      (if (not data)
+          (setq page miniflux-sync-pages-limit)
+        (setq ok-p t)
+        (setq page-entries (append (assoc-default 'entries data) nil)
+              total (assoc-default 'total data)
+              entries (append entries page-entries)
+              offset (+ offset (length page-entries)))
+        (when (or (not full-p)
+                  (not total)
+                  (>= (length entries) total)
+                  (< (length page-entries) miniflux-sync-limit))
+          (setq complete-p (or (and total (>= (length entries) total))
+                               (< (length page-entries) miniflux-sync-limit))
+                page miniflux-sync-pages-limit))))
+    (list entries complete-p total ok-p)))
 
 (defun miniflux-refresh-feed (id)
   "Refresh feed ID on the server."
@@ -295,13 +456,64 @@ Returns parsed JSON on success, t for 204, nil on error."
           (if (< time 0) (float-time) time))
       (error (float-time)))))
 
+(defun miniflux--format-time-rfc3339 (time)
+  "Format unix TIME as an RFC3339 UTC timestamp."
+  (format-time-string "%Y-%m-%dT%H:%M:%SZ" (seconds-to-time time) t))
+
+(defun miniflux--slugify (text)
+  "Return a tag-safe slug for TEXT."
+  (let ((slug (replace-regexp-in-string
+               "[^[:alnum:]_-]+" "-"
+               (downcase (string-trim (or text ""))))))
+    (replace-regexp-in-string "\\`-+\\|-+\\'" "" slug)))
+
+(defun miniflux--category-tag-p (tag)
+  "Return non-nil if TAG is managed by miniflux category sync."
+  (string-prefix-p miniflux-category-tag-prefix (symbol-name tag)))
+
 (defun miniflux--entry-category-tag (entry)
   "Return the Miniflux category title for ENTRY as a symbol, or nil."
   (let* ((feed-data (assoc-default 'feed entry))
          (category (assoc-default 'category feed-data))
          (cat-title (assoc-default 'title category)))
     (when (and cat-title (not (string-empty-p cat-title)))
-      (intern (replace-regexp-in-string "[ \t]+" "-" (downcase cat-title))))))
+      (intern (concat miniflux-category-tag-prefix (miniflux--slugify cat-title))))))
+
+(defun miniflux--feed-meta (feed-data)
+  "Build elfeed feed metadata from Miniflux FEED-DATA."
+  (let* ((category (assoc-default 'category feed-data))
+         (category-title (assoc-default 'title category)))
+    (delq nil
+          (list (when (assoc-default 'site_url feed-data)
+                  (cons :site-url (assoc-default 'site_url feed-data)))
+                (when (assoc-default 'feed_url feed-data)
+                  (cons :feed-url (assoc-default 'feed_url feed-data)))
+                (when (assoc-default 'id category)
+                  (cons :miniflux-category-id (assoc-default 'id category)))
+                (when category-title
+                  (cons :miniflux-category-title category-title))
+                (when (assoc-default 'checked_at feed-data)
+                  (cons :checked-at (assoc-default 'checked_at feed-data)))
+                (when (assoc-default 'next_check_at feed-data)
+                  (cons :next-check-at (assoc-default 'next_check_at feed-data)))
+                (when (assoc-default 'parsing_error_message feed-data)
+                  (cons :parsing-error-message
+                        (assoc-default 'parsing_error_message feed-data)))))))
+
+(defun miniflux--entry-meta (entry author)
+  "Build elfeed entry metadata from Miniflux ENTRY and AUTHOR."
+  (let* ((feed-data (assoc-default 'feed entry))
+         (category (assoc-default 'category feed-data)))
+    `(,@(when (and author (not (string-empty-p author)))
+          (list :authors (list (list :name author))))
+      :miniflux-id ,(assoc-default 'id entry)
+      ,@(when (assoc-default 'id feed-data)
+          (list :miniflux-feed-id (assoc-default 'id feed-data)))
+      ,@(when (assoc-default 'id category)
+          (list :miniflux-category-id (assoc-default 'id category)))
+      ,@(when (assoc-default 'title category)
+          (list :miniflux-category-title (assoc-default 'title category)))
+      ,@(miniflux--feed-meta feed-data))))
 
 (defun miniflux--entry-to-elfeed (entry feed-id-str)
   "Convert a Miniflux ENTRY alist to an elfeed-entry struct.
@@ -331,12 +543,11 @@ FEED-ID-STR is the elfeed feed id string (e.g. \"miniflux://5\")."
      :title title
      :link link
      :date date
-     :content content
-     :content-type 'html
-     :tags tags
-     :feed-id feed-id-str
-     :meta `(,@(when (and author (not (string-empty-p author)))
-                 (list :authors (list (list :name author))))))))
+      :content content
+      :content-type 'html
+      :tags tags
+      :feed-id feed-id-str
+      :meta (miniflux--entry-meta entry author))))
 
 (defun miniflux--sync-entries (data feed-id-str)
   "Convert DATA entries and add them to the elfeed database.
@@ -364,14 +575,18 @@ FEED-ID-STR is the elfeed feed id."
 (defun miniflux--build-feed-from-entry (entry)
   "Ensure elfeed feed object exists for the feed referenced by ENTRY."
   (let* ((feed-data (assoc-default 'feed entry))
-         (feed-id (assoc-default 'id feed-data))
-         (feed-title (or (assoc-default 'title feed-data) (format "Feed %d" feed-id)))
-         (feed-id-str (miniflux--feed-url feed-id)))
-    (elfeed-db-ensure)
-    (puthash feed-id-str
-             (elfeed-feed--create :id feed-id-str :url feed-id-str :title feed-title)
-             elfeed-db-feeds)
-    feed-id-str))
+          (feed-id (assoc-default 'id feed-data))
+          (feed-title (or (assoc-default 'title feed-data) (format "Feed %d" feed-id)))
+          (feed-id-str (miniflux--feed-url feed-id)))
+     (elfeed-db-ensure)
+     (puthash feed-id-str
+              (elfeed-feed--create :id feed-id-str
+                                   :url (or (assoc-default 'site_url feed-data)
+                                            (assoc-default 'feed_url feed-data)
+                                            feed-id-str)
+                                   :title feed-title)
+              elfeed-db-feeds)
+     feed-id-str))
 
 (defun miniflux--convert-entries (raw-entries)
   "Convert RAW-ENTRIES from Miniflux API to elfeed entries and add to DB."
@@ -405,11 +620,95 @@ FEED-ID-STR is the elfeed feed id."
           (miniflux--convert-entries entries)
           entries)))))
 
-(defun miniflux--reconcile-all-stars (api-starred-ids)
+(defun miniflux--record-api-entry (entry api-table api-starred-ids api-unread-ids)
+  "Record ENTRY state in sync hash tables."
+  (let ((id (cons 'miniflux (format "%d" (assoc-default 'id entry)))))
+    (puthash id entry api-table)
+    (when (eq t (assoc-default 'starred entry))
+      (puthash id t api-starred-ids))
+    (when (equal (assoc-default 'status entry) "unread")
+      (puthash id t api-unread-ids))))
+
+(defun miniflux--store-and-record-entries (entries api-table api-starred-ids api-unread-ids)
+  "Store ENTRIES in elfeed and update sync hash tables."
+  (when entries
+    (miniflux--convert-entries entries)
+    (dolist (entry entries)
+      (miniflux--record-api-entry entry api-table api-starred-ids api-unread-ids)))
+  (length entries))
+
+(defun miniflux--recent-sync-filters ()
+  "Return filters for the recent entries sync batch."
+  (append (list :order "published_at")
+          (when (and miniflux-sync-incremental miniflux-last-sync-time)
+            (list :after (miniflux--format-time-rfc3339 miniflux-last-sync-time)))))
+
+(defun miniflux--perform-sync ()
+  "Perform the Miniflux -> elfeed sync and return number of stored entries."
+  (message "Miniflux: syncing...")
+  (let ((api-table (make-hash-table :test 'equal))
+        (api-starred-ids (make-hash-table :test 'equal))
+        (api-unread-ids (make-hash-table :test 'equal))
+        (starred-batch-complete nil)
+        (unread-batch-complete nil)
+        (ok-count 0)
+        (total-entries 0))
+    (let* ((recent-result (miniflux--fetch-entry-pages
+                           (miniflux--recent-sync-filters) nil))
+           (recent-entries (nth 0 recent-result)))
+      (when (nth 3 recent-result)
+        (setq ok-count (1+ ok-count)))
+      (setq total-entries (+ total-entries
+                             (miniflux--store-and-record-entries
+                              recent-entries api-table api-starred-ids api-unread-ids))))
+    (let* ((starred-result (miniflux--fetch-entry-pages
+                            (list :starred "1") miniflux-sync-full-starred))
+           (starred-entries (nth 0 starred-result)))
+      (setq starred-batch-complete (nth 1 starred-result)
+            total-entries (+ total-entries
+                             (miniflux--store-and-record-entries
+                              starred-entries api-table api-starred-ids api-unread-ids)))
+      (when (nth 3 starred-result)
+        (setq ok-count (1+ ok-count))))
+    (let* ((unread-result (miniflux--fetch-entry-pages
+                           (list :status "unread") miniflux-sync-full-unread))
+           (unread-entries (nth 0 unread-result)))
+      (setq unread-batch-complete (nth 1 unread-result)
+            total-entries (+ total-entries
+                             (miniflux--store-and-record-entries
+                              unread-entries api-table api-starred-ids api-unread-ids)))
+      (when (nth 3 unread-result)
+        (setq ok-count (1+ ok-count))))
+    (let ((star-changes (miniflux--reconcile-all-stars
+                         api-starred-ids starred-batch-complete)))
+      (when (> star-changes 0)
+        (message "Miniflux: reconciled %d star tag(s)" star-changes)))
+    (let ((unread-changes (miniflux--reconcile-all-unread
+                           api-unread-ids unread-batch-complete)))
+      (when (> unread-changes 0)
+        (message "Miniflux: reconciled %d unread tag(s)" unread-changes)))
+    (miniflux--reconcile-entry-tags api-table)
+    (elfeed-db-save)
+    (when (> ok-count 0)
+      (setq miniflux-last-sync-time (float-time)))
+    (if (> total-entries 0)
+        (message "Miniflux: synced %d entries" total-entries)
+      (message "Miniflux: no entries found (check server/credentials)"))
+    total-entries))
+
+(defun miniflux--reconcile-all-stars (api-starred-ids complete-p)
   "Reconcile star tags for ALL local miniflux entries against the API.
 API-STARRED-IDS is a hash table keyed by entry-id (cons) for entries
-that are starred on the server.  Iterates over every miniflux entry in
+that are starred on the server.  COMPLETE-P is non-nil when the starred
+batch was not full, meaning api-starred-ids is the complete set of
+starred entries on the server.
+
+When COMPLETE-P: iterates over every miniflux entry in
 `elfeed-db-entries' and forces the local star tag to match the server.
+When NOT COMPLETE-P: only adds star tags (entries in api-starred-ids
+that lack it locally) but does not remove them (to avoid false negatives
+from incomplete batches).
+
 Returns the number of entries changed.
 
 This uses (setf elfeed-entry-tags) which goes through our custom gv-setter
@@ -423,16 +722,16 @@ Therefore elfeed's tag hooks are NOT triggered and no API calls are made."
                 (has-star (memq miniflux-sync-star-tag tags))
                 (should-star (gethash id api-starred-ids)))
            (cond
-            ;; Local has star, API doesn't → remove star
-            ((and has-star (not should-star))
-             (setf (elfeed-entry-tags entry)
-                   (delq miniflux-sync-star-tag tags))
-             (setq changed (1+ changed)))
-            ;; API has star, local doesn't → add star
-            ((and should-star (not has-star))
-             (push miniflux-sync-star-tag tags)
-             (setf (elfeed-entry-tags entry) tags)
-             (setq changed (1+ changed)))))))
+             ;; Local has star, API doesn't -> remove only if batch complete
+             ((and has-star (not should-star) complete-p)
+              (setf (elfeed-entry-tags entry)
+                    (delq miniflux-sync-star-tag tags))
+              (setq changed (1+ changed)))
+             ;; API has star, local doesn't -> add star
+             ((and should-star (not has-star))
+              (push miniflux-sync-star-tag tags)
+              (setf (elfeed-entry-tags entry) tags)
+              (setq changed (1+ changed)))))))
      elfeed-db-entries)
     changed))
 
@@ -457,16 +756,16 @@ Uses (setf elfeed-entry-tags) → no elfeed hooks are triggered."
                 (has-unread (memq 'unread tags))
                 (should-unread (gethash id api-unread-ids)))
            (cond
-            ;; API doesn't have unread, local does → remove (only if batch complete)
-            ((and has-unread (not should-unread) complete-p)
-             (setf (elfeed-entry-tags entry)
-                   (delq 'unread tags))
-             (setq changed (1+ changed)))
-            ;; API has unread, local doesn't → add
-            ((and should-unread (not has-unread))
-             (setf (elfeed-entry-tags entry)
-                   (cons 'unread tags))
-             (setq changed (1+ changed)))))))
+             ;; API doesn't have unread, local does -> remove (only if batch complete)
+             ((and has-unread (not should-unread) complete-p)
+              (setf (elfeed-entry-tags entry)
+                    (delq 'unread tags))
+              (setq changed (1+ changed)))
+             ;; API has unread, local doesn't -> add
+             ((and should-unread (not has-unread))
+              (setf (elfeed-entry-tags entry)
+                    (cons 'unread tags))
+              (setq changed (1+ changed)))))))
      elfeed-db-entries)
     changed))
 
@@ -486,17 +785,22 @@ Uses direct (setf elfeed-entry-tags) -> no elfeed hooks are triggered."
      (let* ((api-cat (miniflux--entry-category-tag api-entry))
             (e (gethash id elfeed-db-entries)))
        (when e
-         ;; Fix titles with newlines
-         (let ((title (elfeed-entry-title e)))
-           (when (string-match-p "[\n\r]" title)
-             (setf (elfeed-entry-title e)
-                   (replace-regexp-in-string "[\n\r]+" " " title))))
-          ;; Ensure the current category tag exists without deleting user tags.
-          (let* ((tags (elfeed-entry-tags e))
-                 (tags (copy-sequence tags)))
-            (when (and api-cat (not (memq api-cat tags)))
-              (push api-cat tags))
-            (setf (elfeed-entry-tags e) tags)))))
+          ;; Fix titles with newlines
+          (let ((title (elfeed-entry-title e)))
+            (when (string-match-p "[\n\r]" title)
+              (setf (elfeed-entry-title e)
+                    (replace-regexp-in-string "[\n\r]+" " " title))))
+           ;; Replace stale miniflux category tags without touching user tags.
+           (let* ((tags (elfeed-entry-tags e))
+                  (tags (cl-remove-if #'miniflux--category-tag-p
+                                      (copy-sequence tags))))
+             (when (and api-cat (not (memq api-cat tags)))
+               (push api-cat tags))
+             (setf (elfeed-entry-meta e)
+                   (append (miniflux--entry-meta api-entry
+                                                 (or (assoc-default 'author api-entry) ""))
+                           (elfeed-entry-meta e)))
+             (setf (elfeed-entry-tags e) tags)))))
    api-table))
 
 (defun miniflux-sync ()
@@ -511,8 +815,8 @@ Flow:
   2. Add/update them in elfeed DB (elfeed-db-add preserves local tags
      for existing entries; reconciliation fixes them in step 4).
   3. Build api-starred-ids and api-unread-ids hash tables.
-  4. Star reconciliation: iterate over ALL local miniflux entries
-     and force star tags to match api-starred-ids.
+  4. Star reconciliation: iterate over local miniflux entries and force
+     star tags to match api-starred-ids when the starred batch is complete.
   5. Unread reconciliation: iterate over ALL local miniflux entries
      and force unread tags to match api-unread-ids.
   6. Category reconciliation: for entries in api-table, sync category tags.
@@ -523,65 +827,34 @@ Flow:
   (miniflux--install-hooks)
   (when miniflux--sync-in-progress
     (user-error "Sync already in progress"))
-  (let ((miniflux--sync-in-progress t))
-    (unwind-protect
-        (progn
-          (message "Miniflux: syncing...")
-          (let ((api-table (make-hash-table :test 'equal))
-                (api-starred-ids (make-hash-table :test 'equal))
-                (api-unread-ids (make-hash-table :test 'equal))
-                (unread-batch-complete t)
-                (total-entries 0))
-            ;; Phase 1: Fetch starred and recent entries from API.
-            (dolist (batch (list (list :limit miniflux-sync-limit :starred "1")
-                                 (list :limit miniflux-sync-limit :order "published_at")))
-              (let ((raw (miniflux--fetch-and-store batch)))
-                (when raw
-                  (setq total-entries (+ total-entries (length raw)))
-                  (dolist (e (append raw nil))
-                    (let ((id (cons 'miniflux (format "%d" (assoc-default 'id e)))))
-                      (puthash id e api-table)
-                      (when (eq t (assoc-default 'starred e))
-                        (puthash id t api-starred-ids))
-                      (when (equal (assoc-default 'status e) "unread")
-                        (puthash id t api-unread-ids)))))))
-            ;; Phase 1b: Fetch unread entries separately to track batch completeness.
-            (let ((unread-data (miniflux--request :GET "/entries"
-                                                  nil
-                                                  (list (cons "limit" (number-to-string miniflux-sync-limit))
-                                                        (cons "status" "unread")))))
-              (when unread-data
-                (let ((entries (assoc-default 'entries unread-data))
-                      (total (assoc-default 'total unread-data)))
-                  ;; Check if batch is complete (total <= limit means we have all unread entries)
-                  (when (and total (>= total miniflux-sync-limit))
-                    (setq unread-batch-complete nil))
-                  ;; Add unread entries to elfeed DB and build api-unread-ids
-                  (when entries
-                    (miniflux--convert-entries entries)
-                    (setq total-entries (+ total-entries (length entries)))
-                    (dolist (e (append entries nil))
-                      (let ((id (cons 'miniflux (format "%d" (assoc-default 'id e)))))
-                        (puthash id e api-table)
-                        (puthash id t api-unread-ids)
-                        (when (eq t (assoc-default 'starred e))
-                          (puthash id t api-starred-ids))))))))
-            ;; Phase 2: Reconcile star tags for ALL local miniflux entries.
-            (let ((star-changes (miniflux--reconcile-all-stars api-starred-ids)))
-              (when (> star-changes 0)
-                (message "Miniflux: reconciled %d star tag(s)" star-changes)))
-            ;; Phase 3: Reconcile unread tags for ALL local miniflux entries.
-            (let ((unread-changes (miniflux--reconcile-all-unread
-                                   api-unread-ids unread-batch-complete)))
-              (when (> unread-changes 0)
-                (message "Miniflux: reconciled %d unread tag(s)" unread-changes)))
-            ;; Phase 4: Reconcile category tags for API-fetched entries.
-            (miniflux--reconcile-entry-tags api-table)
-            (elfeed-db-save)
-            (if (> total-entries 0)
-                (message "Miniflux: synced %d entries" total-entries)
-              (message "Miniflux: no entries found (check server/credentials)"))))
-      (setq miniflux--sync-in-progress nil))))
+  (setq miniflux--sync-in-progress t)
+  (unwind-protect
+      (miniflux--perform-sync)
+    (setq miniflux--sync-in-progress nil)))
+
+(defun miniflux-sync-async ()
+  "Run `miniflux-sync' from an idle timer so the command returns immediately."
+  (interactive)
+  (when miniflux--sync-in-progress
+    (user-error "Sync already in progress"))
+  (setq miniflux--sync-in-progress t)
+  (run-at-time
+   0 nil
+   (lambda ()
+     (unwind-protect
+         (condition-case err
+             (progn
+               (miniflux--check-auth)
+               (miniflux--ensure-elfeed)
+               (miniflux--install-hooks)
+               (miniflux--perform-sync)
+               (when (get-buffer (elfeed-search-buffer))
+                 (with-current-buffer (elfeed-search-buffer)
+                   (elfeed-search-update :force))))
+           (error
+            (message "Miniflux async sync error: %s" (error-message-string err))))
+       (setq miniflux--sync-in-progress nil))))
+  (message "Miniflux: async sync scheduled"))
 
 (defun miniflux--entry-mf-id (entry)
   "Get the Miniflux numeric ID from an elfeed ENTRY, or nil."
@@ -597,6 +870,135 @@ Flow:
         (when (string-match "\\`miniflux://\\([0-9]+\\)\\'" feed-id)
           (string-to-number (match-string 1 feed-id)))))))
 
+(defun miniflux--selected-entries ()
+  "Return selected elfeed entries in `elfeed-search-mode'."
+  (miniflux--ensure-elfeed)
+  (or (and (fboundp 'elfeed-search-selected)
+           (elfeed-search-selected))
+      (user-error "No elfeed entries selected")))
+
+(defun miniflux--selected-entry ()
+  "Return one selected elfeed entry."
+  (car (miniflux--selected-entries)))
+
+(defun miniflux--entry-category-id (entry)
+  "Return Miniflux category id for ENTRY, or nil."
+  (plist-get (elfeed-entry-meta entry) :miniflux-category-id))
+
+(defun miniflux--mark-entries-sync-failed (entries)
+  "Mark ENTRIES with `miniflux-sync-failed-tag'."
+  (dolist (entry entries)
+    (let ((tags (elfeed-entry-tags entry)))
+      (unless (memq miniflux-sync-failed-tag tags)
+        (setf (elfeed-entry-tags entry)
+              (cons miniflux-sync-failed-tag tags))))))
+
+(defun miniflux--clear-entries-sync-failed (entries)
+  "Remove `miniflux-sync-failed-tag' from ENTRIES."
+  (dolist (entry entries)
+    (when (memq miniflux-sync-failed-tag (elfeed-entry-tags entry))
+      (setf (elfeed-entry-tags entry)
+            (delq miniflux-sync-failed-tag (elfeed-entry-tags entry))))))
+
+(defun miniflux-clear-sync-failed ()
+  "Clear sync failure markers from selected elfeed entries."
+  (interactive nil elfeed-search-mode)
+  (miniflux--clear-entries-sync-failed (miniflux--selected-entries))
+  (elfeed-db-save)
+  (elfeed-search-update :force))
+
+(defun miniflux--web-url (path-format id)
+  "Build a Miniflux web URL from PATH-FORMAT and ID."
+  (concat (directory-file-name miniflux-server) (format path-format id)))
+
+(defun miniflux-open-entry-in-miniflux ()
+  "Open the selected entry in the Miniflux web interface."
+  (interactive nil elfeed-search-mode)
+  (let ((id (miniflux--entry-mf-id (miniflux--selected-entry))))
+    (unless id
+      (user-error "Selected entry is not a Miniflux entry"))
+    (browse-url (miniflux--web-url miniflux-web-entry-path id))))
+
+(defun miniflux-open-feed-in-miniflux ()
+  "Open the selected entry's feed in the Miniflux web interface."
+  (interactive nil elfeed-search-mode)
+  (let ((id (miniflux--entry-mf-feed-id (miniflux--selected-entry))))
+    (unless id
+      (user-error "Selected entry has no Miniflux feed id"))
+    (browse-url (miniflux--web-url miniflux-web-feed-path id))))
+
+(defun miniflux-refresh-current-feed ()
+  "Refresh the selected entry's feed on the Miniflux server."
+  (interactive nil elfeed-search-mode)
+  (let ((id (miniflux--entry-mf-feed-id (miniflux--selected-entry))))
+    (unless id
+      (user-error "Selected entry has no Miniflux feed id"))
+    (if (miniflux-refresh-feed id)
+        (message "Miniflux: refreshed feed %d" id)
+      (user-error "Miniflux: failed to refresh feed %d" id))))
+
+(defun miniflux-mark-current-feed-read ()
+  "Mark the selected entry's feed as read on Miniflux, then sync."
+  (interactive nil elfeed-search-mode)
+  (let ((id (miniflux--entry-mf-feed-id (miniflux--selected-entry))))
+    (unless id
+      (user-error "Selected entry has no Miniflux feed id"))
+    (if (miniflux-mark-feed-as-read id)
+        (miniflux-search-refresh)
+      (user-error "Miniflux: failed to mark feed %d as read" id))))
+
+(defun miniflux-mark-current-category-read ()
+  "Mark the selected entry's category as read on Miniflux, then sync."
+  (interactive nil elfeed-search-mode)
+  (let ((id (miniflux--entry-category-id (miniflux--selected-entry))))
+    (unless id
+      (user-error "Selected entry has no Miniflux category id"))
+    (if (miniflux-mark-category-as-read id)
+        (miniflux-search-refresh)
+      (user-error "Miniflux: failed to mark category %d as read" id))))
+
+(defun miniflux-show-unread ()
+  "Show unread Miniflux entries in elfeed search."
+  (interactive)
+  (miniflux--ensure-elfeed)
+  (unless (get-buffer (elfeed-search-buffer))
+    (elfeed-search))
+  (elfeed-search-set-filter "+unread "))
+
+(defun miniflux-show-starred ()
+  "Show starred Miniflux entries in elfeed search."
+  (interactive)
+  (miniflux--ensure-elfeed)
+  (unless (get-buffer (elfeed-search-buffer))
+    (elfeed-search))
+  (elfeed-search-set-filter (format "+%s " miniflux-sync-star-tag)))
+
+(defun miniflux-show-sync-failed ()
+  "Show entries whose local changes failed to sync to Miniflux."
+  (interactive)
+  (miniflux--ensure-elfeed)
+  (unless (get-buffer (elfeed-search-buffer))
+    (elfeed-search))
+  (elfeed-search-set-filter (format "+%s " miniflux-sync-failed-tag)))
+
+(defun miniflux-show-category (category)
+  "Show Miniflux entries tagged with CATEGORY in elfeed search."
+  (interactive "sMiniflux category: ")
+  (miniflux--ensure-elfeed)
+  (unless (get-buffer (elfeed-search-buffer))
+    (elfeed-search))
+  (elfeed-search-set-filter
+   (format "+%s%s " miniflux-category-tag-prefix (miniflux--slugify category))))
+
+(defun miniflux-show-feed ()
+  "Show entries from the selected entry's feed in elfeed search."
+  (interactive nil elfeed-search-mode)
+  (miniflux--ensure-elfeed)
+  (let ((id (miniflux--entry-mf-feed-id (miniflux--selected-entry))))
+    (unless id
+      (user-error "Selected entry has no Miniflux feed id"))
+    (elfeed-search-set-filter (format "@6-months-ago =miniflux://%d " id))))
+
 ;;; ─── Tag sync hooks (elfeed → Miniflux) ───
 
 (defun miniflux--tag-hook (entries tags)
@@ -609,13 +1011,18 @@ NOT push — it only pulls from server."
         (when (memq 'unread tags)
           (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
             (when ids
-              (miniflux-update-entry-status ids "unread"))))
+              (if (miniflux-update-entry-status ids "unread")
+                  (miniflux--clear-entries-sync-failed entries)
+                (miniflux--mark-entries-sync-failed entries)))))
         (when (memq miniflux-sync-star-tag tags)
           (dolist (entry entries)
             (let ((mf-id (miniflux--entry-mf-id entry)))
               (when mf-id
-                (miniflux-toggle-entry-bookmark mf-id))))))
+                (if (miniflux-toggle-entry-bookmark mf-id)
+                    (miniflux--clear-entries-sync-failed (list entry))
+                  (miniflux--mark-entries-sync-failed (list entry))))))))
     (error
+     (miniflux--mark-entries-sync-failed entries)
      (message "Miniflux tag-hook error: %s" (error-message-string err)))))
 
 (defun miniflux--untag-hook (entries tags)
@@ -628,13 +1035,18 @@ NOT push — it only pulls from server."
         (when (memq 'unread tags)
           (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
             (when ids
-              (miniflux-update-entry-status ids "read"))))
+              (if (miniflux-update-entry-status ids "read")
+                  (miniflux--clear-entries-sync-failed entries)
+                (miniflux--mark-entries-sync-failed entries)))))
         (when (memq miniflux-sync-star-tag tags)
           (dolist (entry entries)
             (let ((mf-id (miniflux--entry-mf-id entry)))
               (when mf-id
-                (miniflux-toggle-entry-bookmark mf-id))))))
+                (if (miniflux-toggle-entry-bookmark mf-id)
+                    (miniflux--clear-entries-sync-failed (list entry))
+                  (miniflux--mark-entries-sync-failed (list entry))))))))
     (error
+     (miniflux--mark-entries-sync-failed entries)
      (message "Miniflux untag-hook error: %s" (error-message-string err)))))
 
 ;;; ─── Install hooks and keybindings ───
@@ -667,9 +1079,13 @@ NOT push — it only pulls from server."
   "Set up keybindings for Miniflux integration in elfeed modes."
   (with-eval-after-load 'elfeed-search
     (define-key elfeed-search-mode-map "G" #'miniflux-search-refresh)
+    (define-key elfeed-search-mode-map "M" #'miniflux-mark-current-feed-read)
+    (define-key elfeed-search-mode-map "O" #'miniflux-open-entry-in-miniflux)
     (when (fboundp 'evil-define-key)
       (evil-define-key 'normal elfeed-search-mode-map
-        "G" #'miniflux-search-refresh))))
+        "G" #'miniflux-search-refresh
+        "M" #'miniflux-mark-current-feed-read
+        "O" #'miniflux-open-entry-in-miniflux))))
 
 (miniflux--setup-keybindings)
 

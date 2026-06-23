@@ -54,14 +54,22 @@ Add =miniflux.el= to your =load-path= and:
 
 * Configuration
 
-| Variable               | Default               | Description                                    |
-|------------------------+-----------------------+------------------------------------------------|
-| =miniflux-server=        | ="https://example.com"= | Base URL of your Miniflux instance             |
-| =miniflux-token=         | =""=                    | API token (preferred auth method)              |
-| =miniflux-username=      | =""=                    | Username for HTTP Basic Auth                   |
-| =miniflux-password=      | =""=                    | Password for HTTP Basic Auth                   |
-| =miniflux-sync-limit=    | =200=                   | Max entries fetched per sync batch             |
-| =miniflux-sync-star-tag= | =star=                  | elfeed tag used for starred/bookmarked entries |
+| Variable                         | Default                  | Description                                         |
+|----------------------------------+--------------------------+-----------------------------------------------------|
+| =miniflux-server=                  | ="https://example.com"=    | Base URL of your Miniflux instance                  |
+| =miniflux-token=                   | =""=                       | API token (preferred auth method)                   |
+| =miniflux-username=                | =""=                       | Username for HTTP Basic Auth                        |
+| =miniflux-password=                | =""=                       | Password for HTTP Basic Auth                        |
+| =miniflux-sync-limit=              | =200=                      | Max entries fetched per sync page                   |
+| =miniflux-sync-star-tag=           | =star=                     | elfeed tag used for starred/bookmarked entries      |
+| =miniflux-sync-failed-tag=         | =miniflux-sync-failed=     | tag added when a local push to Miniflux fails       |
+| =miniflux-sync-full-unread=        | =t=                        | fetch all unread pages up to the page limit         |
+| =miniflux-sync-full-starred=       | =t=                        | fetch all starred pages up to the page limit        |
+| =miniflux-sync-pages-limit=        | =20=                       | maximum pages fetched for unread/starred queries    |
+| =miniflux-sync-incremental=        | =t=                        | fetch recent entries changed since last sync        |
+| =miniflux-category-tag-prefix=     | ="miniflux-category-"=     | prefix for category tags managed by miniflux.el     |
+| =miniflux-web-entry-path=          | ="/unread/entry/%d"=       | Miniflux web URL path format for an entry           |
+| =miniflux-web-feed-path=           | ="/feeds/%d/entries"=      | Miniflux web URL path format for a feed             |
 
 ** Example (API token)
 
@@ -82,16 +90,31 @@ Add =miniflux.el= to your =load-path= and:
 
 ** Interactive commands
 
-| Command           | Description                                    |
-|-------------------+------------------------------------------------|
-| =M-x miniflux=      | Sync from server and open elfeed search buffer |
-| =M-x miniflux-sync= | Sync only (background); does not open elfeed   |
+| Command                                  | Description                                           |
+|------------------------------------------+-------------------------------------------------------|
+| =M-x miniflux=                             | Sync from server and open elfeed search buffer        |
+| =M-x miniflux-sync=                        | Sync only; does not open elfeed                       |
+| =M-x miniflux-sync-async=                  | Schedule a sync and return immediately               |
+| =M-x miniflux-search-refresh=              | Sync and refresh elfeed search                        |
+| =M-x miniflux-refresh-current-feed=        | Refresh the selected entry's feed on Miniflux         |
+| =M-x miniflux-mark-current-feed-read=      | Mark the selected entry's feed as read, then sync     |
+| =M-x miniflux-mark-current-category-read=  | Mark the selected entry's category as read, then sync |
+| =M-x miniflux-open-entry-in-miniflux=      | Open the selected entry in the Miniflux web UI        |
+| =M-x miniflux-open-feed-in-miniflux=       | Open the selected entry's feed in the Miniflux web UI |
+| =M-x miniflux-show-unread=                 | Show unread entries in elfeed search                  |
+| =M-x miniflux-show-starred=                | Show starred entries in elfeed search                 |
+| =M-x miniflux-show-category=               | Show entries from a Miniflux category tag             |
+| =M-x miniflux-show-feed=                   | Show entries from the selected entry's feed           |
+| =M-x miniflux-show-sync-failed=            | Show entries whose local push failed                  |
+| =M-x miniflux-clear-sync-failed=           | Clear failure markers from selected entries           |
 
 ** Keybindings in elfeed-search-mode
 
 | Key | Action                                                          |
 |-----+-----------------------------------------------------------------|
 | =G=   | Sync from Miniflux server and refresh (=miniflux-search-refresh=) |
+| =M=   | Mark current feed as read on Miniflux and sync                  |
+| =O=   | Open current entry in the Miniflux web UI                       |
 
 Standard elfeed keybindings continue to work and automatically sync
 back to Miniflux:
@@ -107,19 +130,55 @@ back to Miniflux:
 
 =miniflux-sync= performs the following steps:
 
-1. Fetches /unread/, /starred/, and /recent/ entries from the Miniflux
-   API (up to =miniflux-sync-limit= per batch).
+1. Fetches /recent/, /unread/, and /starred/ entries from the Miniflux
+   API.  Unread and starred entries can be fetched across multiple
+   pages using =miniflux-sync-full-unread=,
+   =miniflux-sync-full-starred=, and =miniflux-sync-pages-limit=.
 2. Converts them to elfeed entries and writes them into the local
    elfeed database.
 3. Reconciles local elfeed read/unread and star tags to match the
-   server-side state.
-4. Saves the elfeed database.
+   server-side state when the server-side batch is known to be complete.
+4. Reconciles Miniflux category tags.  Managed category tags use the
+   =miniflux-category-tag-prefix= namespace so stale category tags can
+   be removed without touching user tags.
+5. Stores Miniflux IDs, category information, and feed details in entry
+   metadata where elfeed can preserve them locally.
+6. Saves the elfeed database and records =miniflux-last-sync-time= for
+   incremental recent-entry sync.
 
 Sync is pull-only: the Miniflux server is the source of truth during
 =miniflux-sync=.  Local changes are pushed to Miniflux immediately by
 elfeed tag hooks when you mark entries read/unread or add/remove the
 configured star tag.  If a push fails because of a network or server
-error, the next sync will restore the server-side state locally.
+error, the entry receives =miniflux-sync-failed-tag= so you can inspect
+it with =M-x miniflux-show-sync-failed=.  The next successful sync will
+still treat the server as the source of truth.
+
+=miniflux-sync-async= schedules a sync and returns immediately.  It uses
+the same sync pipeline as =miniflux-sync= and refreshes the elfeed search
+buffer when possible.
+
+* Development
+
+Run the tests with:
+
+#+begin_src sh
+make test
+#+end_src
+
+Byte-compile with:
+
+#+begin_src sh
+make compile
+#+end_src
+
+Run both checks with:
+
+#+begin_src sh
+make check
+#+end_src
+
+These commands require =elfeed= to be available on Emacs' =load-path=.
 
 * API wrapper
 

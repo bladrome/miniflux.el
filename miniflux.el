@@ -1,5 +1,12 @@
 ;;; miniflux.el --- Miniflux RSS client using elfeed UI -*- lexical-binding: t; -*-
 
+;; Author: bladrome
+;; Maintainer: bladrome
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "27.1") (elfeed "3.4.1"))
+;; Keywords: news, rss, miniflux
+;; URL: https://github.com/bladrome/miniflux.el
+
 ;;; Commentary:
 ;; A Miniflux RSS client that integrates with elfeed's database and UI.
 ;; Fetches entries from a Miniflux server and stores them in elfeed's
@@ -17,7 +24,6 @@
 ;; In elfeed-search-mode:
 ;;   G  — sync from Miniflux server and refresh
 ;;   g  — refresh from local database (revert)
-;;   r  — sync from Miniflux server and refresh (evil/Doom)
 ;;   u  — mark as unread (syncs to Miniflux)
 ;;   r  — mark as read (syncs to Miniflux, non-evil)
 ;;   +  — add tag (e.g. + star to sync star to Miniflux)
@@ -27,22 +33,25 @@
 
 (require 'cl-lib)
 (require 'gv)
+(require 'json)
 (require 'parse-time)
+(require 'subr-x)
 (require 'url)
+(require 'elfeed)
 
-(eval-when-compile
-  (unless (require 'elfeed nil t)
-    (package-initialize)
-    (require 'elfeed)))
-
-(unless (require 'elfeed nil t)
-  (package-initialize)
-  (require 'elfeed))
+(declare-function elfeed-search "elfeed")
+(declare-function elfeed-search-buffer "elfeed-search")
+(declare-function elfeed-search-set-filter "elfeed-search")
+(declare-function elfeed-search-update "elfeed-search")
+(declare-function elfeed-db-add "elfeed-db")
+(declare-function elfeed-db-ensure "elfeed-db")
+(declare-function elfeed-db-save "elfeed-db")
+(declare-function elfeed-entry--create "elfeed-db")
+(declare-function elfeed-feed--create "elfeed-db")
 
 (defun miniflux--ensure-elfeed ()
   "Ensure elfeed is loaded and available."
   (unless (featurep 'elfeed)
-    (package-initialize)
     (require 'elfeed)))
 
 ;; ─── Setf expanders for elfeed-entry struct fields ───
@@ -462,13 +471,16 @@ Uses (setf elfeed-entry-tags) → no elfeed hooks are triggered."
     changed))
 
 (defun miniflux--reconcile-entry-tags (api-table)
-  "Reconcile category tags for entries present in API-TABLE.
-API-TABLE maps entry-id (cons) to raw API entry alist.  For each entry
-that exists locally, force category tags to match the API state.
-Star reconciliation is handled by `miniflux--reconcile-all-stars'.
-Unread reconciliation is handled by `miniflux--reconcile-all-unread'.
+  "Reconcile fetched entry metadata for entries present in API-TABLE.
+API-TABLE maps entry-id (cons) to raw API entry alist.  For each local
+entry found in API-TABLE, normalize multiline titles and ensure the
+current Miniflux category tag exists locally.
 
-Uses direct (setf elfeed-entry-tags) → no elfeed hooks are triggered."
+This function deliberately preserves unrelated local tags.  Star
+reconciliation is handled by `miniflux--reconcile-all-stars'.  Unread
+reconciliation is handled by `miniflux--reconcile-all-unread'.
+
+Uses direct (setf elfeed-entry-tags) -> no elfeed hooks are triggered."
   (maphash
    (lambda (id api-entry)
      (let* ((api-cat (miniflux--entry-category-tag api-entry))
@@ -479,15 +491,12 @@ Uses direct (setf elfeed-entry-tags) → no elfeed hooks are triggered."
            (when (string-match-p "[\n\r]" title)
              (setf (elfeed-entry-title e)
                    (replace-regexp-in-string "[\n\r]+" " " title))))
-         ;; Reconcile category tags to match API state
-         (let* ((tags (elfeed-entry-tags e))
-                (tags (cl-loop for tag in tags
-                               when (or (memq tag '(unread star))
-                                        (eq tag api-cat))
-                               collect tag)))
-           (when (and api-cat (not (memq api-cat tags)))
-             (push api-cat tags))
-           (setf (elfeed-entry-tags e) tags)))))
+          ;; Ensure the current category tag exists without deleting user tags.
+          (let* ((tags (elfeed-entry-tags e))
+                 (tags (copy-sequence tags)))
+            (when (and api-cat (not (memq api-cat tags)))
+              (push api-cat tags))
+            (setf (elfeed-entry-tags e) tags)))))
    api-table))
 
 (defun miniflux-sync ()

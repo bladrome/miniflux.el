@@ -21,8 +21,8 @@ of read/unread and starred status.
   natively.
 - *Category tags* — Miniflux categories are automatically imported as
   elfeed tags.
-- *No external dependencies* — only relies on built-in =url.el= and
-  =elfeed= (installed automatically if missing).
+- *Small dependency surface* — only relies on built-in =url.el= and
+  =elfeed=.
 
 * Installation
 
@@ -92,7 +92,6 @@ Add =miniflux.el= to your =load-path= and:
 | Key | Action                                                          |
 |-----+-----------------------------------------------------------------|
 | =G=   | Sync from Miniflux server and refresh (=miniflux-search-refresh=) |
-| =r=   | Sync + refresh (evil/Doom users, normal state)                  |
 
 Standard elfeed keybindings continue to work and automatically sync
 back to Miniflux:
@@ -112,8 +111,15 @@ back to Miniflux:
    API (up to =miniflux-sync-limit= per batch).
 2. Converts them to elfeed entries and writes them into the local
    elfeed database.
-3. Compares local elfeed tags with server-side status and pushes any
-   differences (read/unread, star/unstar) back to Miniflux.
+3. Reconciles local elfeed read/unread and star tags to match the
+   server-side state.
+4. Saves the elfeed database.
+
+Sync is pull-only: the Miniflux server is the source of truth during
+=miniflux-sync=.  Local changes are pushed to Miniflux immediately by
+elfeed tag hooks when you mark entries read/unread or add/remove the
+configured star tag.  If a push fails because of a network or server
+error, the next sync will restore the server-side state locally.
 
 * API wrapper
 
@@ -151,7 +157,7 @@ you can use in your own Elisp code:
 * Compatibility
 
 - Emacs 27+ (tested on Emacs 29)
-- Requires [[https://github.com/skeeto/elfeed][elfeed]] (installed automatically if not present)
+- Requires [[https://github.com/skeeto/elfeed][elfeed]]
 - Works with [[https://github.com/emacs-evil/evil][evil-mode]] keybindings in elfeed-search-mode
 
 * License

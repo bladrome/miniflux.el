@@ -157,7 +157,7 @@ still uses their dedicated queries."
   :type '(boolean)
   :group 'miniflux)
 
-(defcustom miniflux-category-tag-prefix "miniflux-category-"
+(defcustom miniflux-category-tag-prefix ""
   "Prefix used for Miniflux category tags in elfeed.
 Using a namespace lets sync replace stale category tags without touching
 unrelated user tags."
@@ -386,6 +386,51 @@ When FULL-P is non-nil, continue until the API total is exhausted or
                                (< (length page-entries) miniflux-sync-limit))
                 page miniflux-sync-pages-limit))))
     (list entries complete-p total ok-p)))
+
+(defun miniflux--fetch-entry-pages-async (filters full-p callback)
+  "Fetch entry pages matching FILTERS asynchronously.
+When FULL-P is non-nil, continue until the API total is exhausted or
+`miniflux-sync-pages-limit' is reached.  Call CALLBACK with
+(ENTRIES COMPLETE-P TOTAL OK-P)."
+  (let ((offset 0)
+        (page 0)
+        (entries nil)
+        (total nil)
+        (complete-p nil)
+        (ok-p nil))
+    (cl-labels
+        ((done ()
+           (funcall callback (list entries complete-p total ok-p)))
+         (next ()
+           (if (not (and (or (= page 0)
+                             (and full-p total (< (length entries) total)))
+                         (< page miniflux-sync-pages-limit)))
+               (done)
+             (miniflux--request-async
+              :GET "/entries"
+              (lambda (data)
+                (setq page (1+ page))
+                (if (not data)
+                    (done)
+                  (let ((page-entries (append (assoc-default 'entries data) nil)))
+                    (setq ok-p t
+                          total (assoc-default 'total data)
+                          entries (append entries page-entries)
+                          offset (+ offset (length page-entries)))
+                    (if (or (not full-p)
+                            (not total)
+                            (>= (length entries) total)
+                            (< (length page-entries) miniflux-sync-limit))
+                        (progn
+                          (setq complete-p (or (and total (>= (length entries) total))
+                                               (< (length page-entries) miniflux-sync-limit)))
+                          (done))
+                      (next)))))
+              nil
+              (miniflux--filters-to-params
+               (append filters (list :limit miniflux-sync-limit
+                                     :offset offset)))))))
+      (next))))
 
 (defun miniflux-refresh-feed (id)
   "Refresh feed ID on the server."
@@ -650,6 +695,27 @@ FEED-ID-STR is the elfeed feed id."
           (when (and miniflux-sync-incremental miniflux-last-sync-time)
             (list :after (miniflux--format-time-rfc3339 miniflux-last-sync-time)))))
 
+(defun miniflux--finish-sync (api-table api-starred-ids api-unread-ids
+                                        starred-batch-complete unread-batch-complete
+                                        ok-count total-entries)
+  "Reconcile and save sync state, then return TOTAL-ENTRIES."
+  (let ((star-changes (miniflux--reconcile-all-stars
+                       api-starred-ids starred-batch-complete)))
+    (when (> star-changes 0)
+      (message "Miniflux: reconciled %d star tag(s)" star-changes)))
+  (let ((unread-changes (miniflux--reconcile-all-unread
+                         api-unread-ids unread-batch-complete)))
+    (when (> unread-changes 0)
+      (message "Miniflux: reconciled %d unread tag(s)" unread-changes)))
+  (miniflux--reconcile-entry-tags api-table)
+  (elfeed-db-save)
+  (when (> ok-count 0)
+    (setq miniflux-last-sync-time (float-time)))
+  (if (> total-entries 0)
+      (message "Miniflux: synced %d entries" total-entries)
+    (message "Miniflux: no entries found (check server/credentials)"))
+  total-entries)
+
 (defun miniflux--perform-sync ()
   "Perform the Miniflux -> elfeed sync and return number of stored entries."
   (message "Miniflux: syncing...")
@@ -686,22 +752,73 @@ FEED-ID-STR is the elfeed feed id."
                               unread-entries api-table api-starred-ids api-unread-ids)))
       (when (nth 3 unread-result)
         (setq ok-count (1+ ok-count))))
-    (let ((star-changes (miniflux--reconcile-all-stars
-                         api-starred-ids starred-batch-complete)))
-      (when (> star-changes 0)
-        (message "Miniflux: reconciled %d star tag(s)" star-changes)))
-    (let ((unread-changes (miniflux--reconcile-all-unread
-                           api-unread-ids unread-batch-complete)))
-      (when (> unread-changes 0)
-        (message "Miniflux: reconciled %d unread tag(s)" unread-changes)))
-    (miniflux--reconcile-entry-tags api-table)
-    (elfeed-db-save)
-    (when (> ok-count 0)
-      (setq miniflux-last-sync-time (float-time)))
-    (if (> total-entries 0)
-        (message "Miniflux: synced %d entries" total-entries)
-      (message "Miniflux: no entries found (check server/credentials)"))
-    total-entries))
+    (miniflux--finish-sync api-table api-starred-ids api-unread-ids
+                           starred-batch-complete unread-batch-complete
+                           ok-count total-entries)))
+
+(defun miniflux--perform-sync-async (callback)
+  "Perform the Miniflux -> elfeed sync asynchronously.
+Call CALLBACK with the stored entry count on success, or nil on failure."
+  (message "Miniflux: syncing...")
+  (let ((api-table (make-hash-table :test 'equal))
+        (api-starred-ids (make-hash-table :test 'equal))
+        (api-unread-ids (make-hash-table :test 'equal))
+        (starred-batch-complete nil)
+        (unread-batch-complete nil)
+        (ok-count 0)
+        (total-entries 0))
+    (cl-labels
+        ((store (entries)
+           (setq total-entries
+                 (+ total-entries
+                    (miniflux--store-and-record-entries
+                     entries api-table api-starred-ids api-unread-ids))))
+         (fail (err)
+           (message "Miniflux async sync error: %s" (error-message-string err))
+           (funcall callback nil))
+         (finish ()
+           (condition-case err
+               (funcall callback
+                        (miniflux--finish-sync api-table api-starred-ids api-unread-ids
+                                               starred-batch-complete unread-batch-complete
+                                               ok-count total-entries))
+             (error (fail err))))
+         (fetch-unread ()
+           (miniflux--fetch-entry-pages-async
+            (list :status "unread") miniflux-sync-full-unread
+            (lambda (result)
+              (condition-case err
+                  (progn
+                    (setq unread-batch-complete (nth 1 result))
+                    (store (nth 0 result))
+                    (when (nth 3 result)
+                      (setq ok-count (1+ ok-count)))
+                    (finish))
+                (error (fail err))))))
+         (fetch-starred ()
+           (miniflux--fetch-entry-pages-async
+            (list :starred "1") miniflux-sync-full-starred
+            (lambda (result)
+              (condition-case err
+                  (progn
+                    (setq starred-batch-complete (nth 1 result))
+                    (store (nth 0 result))
+                    (when (nth 3 result)
+                      (setq ok-count (1+ ok-count)))
+                    (fetch-unread))
+                (error (fail err))))))
+         (fetch-recent ()
+           (miniflux--fetch-entry-pages-async
+            (miniflux--recent-sync-filters) nil
+            (lambda (result)
+              (condition-case err
+                  (progn
+                    (store (nth 0 result))
+                    (when (nth 3 result)
+                      (setq ok-count (1+ ok-count)))
+                    (fetch-starred))
+                (error (fail err)))))))
+      (fetch-recent))))
 
 (defun miniflux--reconcile-all-stars (api-starred-ids complete-p)
   "Reconcile star tags for ALL local miniflux entries against the API.
@@ -841,28 +958,26 @@ Flow:
     (setq miniflux--sync-in-progress nil)))
 
 (defun miniflux-sync-async ()
-  "Run `miniflux-sync' from an idle timer so the command returns immediately."
+  "Start a non-blocking Miniflux sync and return immediately."
   (interactive)
+  (miniflux--check-auth)
+  (miniflux--ensure-elfeed)
+  (miniflux--install-hooks)
   (when miniflux--sync-in-progress
     (user-error "Sync already in progress"))
   (setq miniflux--sync-in-progress t)
-  (run-at-time
-   0 nil
-   (lambda ()
-     (unwind-protect
-         (condition-case err
-             (progn
-               (miniflux--check-auth)
-               (miniflux--ensure-elfeed)
-               (miniflux--install-hooks)
-               (miniflux--perform-sync)
-               (when (get-buffer (elfeed-search-buffer))
-                 (with-current-buffer (elfeed-search-buffer)
-                   (elfeed-search-update :force))))
-           (error
-            (message "Miniflux async sync error: %s" (error-message-string err))))
-       (setq miniflux--sync-in-progress nil))))
-  (message "Miniflux: async sync scheduled"))
+  (condition-case err
+      (miniflux--perform-sync-async
+       (lambda (_total)
+         (unwind-protect
+             (when (get-buffer (elfeed-search-buffer))
+               (with-current-buffer (elfeed-search-buffer)
+                 (elfeed-search-update :force)))
+           (setq miniflux--sync-in-progress nil))))
+    (error
+     (setq miniflux--sync-in-progress nil)
+     (signal (car err) (cdr err))))
+  (message "Miniflux: async sync started"))
 
 (defun miniflux--entry-mf-id (entry)
   "Get the Miniflux numeric ID from an elfeed ENTRY, or nil."

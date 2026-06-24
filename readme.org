@@ -94,7 +94,7 @@ Add =miniflux.el= to your =load-path= and:
 |------------------------------------------+-------------------------------------------------------|
 | =M-x miniflux=                             | Sync from server and open elfeed search buffer        |
 | =M-x miniflux-sync=                        | Sync only; does not open elfeed                       |
-| =M-x miniflux-sync-async=                  | Schedule a sync and return immediately               |
+| =M-x miniflux-sync-async=                  | Start a non-blocking sync and return immediately     |
 | =M-x miniflux-search-refresh=              | Sync and refresh elfeed search                        |
 | =M-x miniflux-refresh-current-feed=        | Refresh the selected entry's feed on Miniflux         |
 | =M-x miniflux-mark-current-feed-read=      | Mark the selected entry's feed as read, then sync     |
@@ -159,9 +159,10 @@ bookmark state before toggling it, because Miniflux exposes bookmark
 changes as a toggle endpoint.  The next successful sync will still treat
 the server as the source of truth.
 
-=miniflux-sync-async= schedules a sync and returns immediately.  It uses
-the same sync pipeline as =miniflux-sync= and refreshes the elfeed search
-buffer when possible.
+=miniflux-sync-async= uses asynchronous =url.el= requests for the API
+fetches, so Emacs remains responsive while Miniflux is contacted.  It
+uses the same reconciliation pipeline as =miniflux-sync= and refreshes
+the elfeed search buffer when possible.
 
 * Development
 

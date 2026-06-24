@@ -20,6 +20,7 @@
 ;; Usage:
 ;;   M-x miniflux          — sync from server, then open elfeed
 ;;   M-x miniflux-sync     — sync only (background)
+;;   M-x miniflux-retry-sync-failed — retry failed local pushes
 ;;
 ;; In elfeed-search-mode:
 ;;   G  — sync from Miniflux server and refresh
@@ -483,22 +484,28 @@ When FULL-P is non-nil, continue until the API total is exhausted or
   "Build elfeed feed metadata from Miniflux FEED-DATA."
   (let* ((category (assoc-default 'category feed-data))
          (category-title (assoc-default 'title category)))
-    (delq nil
-          (list (when (assoc-default 'site_url feed-data)
-                  (cons :site-url (assoc-default 'site_url feed-data)))
-                (when (assoc-default 'feed_url feed-data)
-                  (cons :feed-url (assoc-default 'feed_url feed-data)))
-                (when (assoc-default 'id category)
-                  (cons :miniflux-category-id (assoc-default 'id category)))
-                (when category-title
-                  (cons :miniflux-category-title category-title))
-                (when (assoc-default 'checked_at feed-data)
-                  (cons :checked-at (assoc-default 'checked_at feed-data)))
-                (when (assoc-default 'next_check_at feed-data)
-                  (cons :next-check-at (assoc-default 'next_check_at feed-data)))
-                (when (assoc-default 'parsing_error_message feed-data)
-                  (cons :parsing-error-message
-                        (assoc-default 'parsing_error_message feed-data)))))))
+    `(,@(when (assoc-default 'site_url feed-data)
+          (list :site-url (assoc-default 'site_url feed-data)))
+      ,@(when (assoc-default 'feed_url feed-data)
+          (list :feed-url (assoc-default 'feed_url feed-data)))
+      ,@(when (assoc-default 'id category)
+          (list :miniflux-category-id (assoc-default 'id category)))
+      ,@(when category-title
+          (list :miniflux-category-title category-title))
+      ,@(when (assoc-default 'checked_at feed-data)
+          (list :checked-at (assoc-default 'checked_at feed-data)))
+      ,@(when (assoc-default 'next_check_at feed-data)
+          (list :next-check-at (assoc-default 'next_check_at feed-data)))
+      ,@(when (assoc-default 'parsing_error_message feed-data)
+          (list :parsing-error-message
+                (assoc-default 'parsing_error_message feed-data))))))
+
+(defun miniflux--plist-merge (new old)
+  "Return OLD plist updated with all key/value pairs from NEW."
+  (let ((result (copy-sequence old)))
+    (while new
+      (setq result (plist-put result (pop new) (pop new))))
+    result))
 
 (defun miniflux--entry-meta (entry author)
   "Build elfeed entry metadata from Miniflux ENTRY and AUTHOR."
@@ -794,13 +801,14 @@ Uses direct (setf elfeed-entry-tags) -> no elfeed hooks are triggered."
            (let* ((tags (elfeed-entry-tags e))
                   (tags (cl-remove-if #'miniflux--category-tag-p
                                       (copy-sequence tags))))
-             (when (and api-cat (not (memq api-cat tags)))
-               (push api-cat tags))
-             (setf (elfeed-entry-meta e)
-                   (append (miniflux--entry-meta api-entry
-                                                 (or (assoc-default 'author api-entry) ""))
-                           (elfeed-entry-meta e)))
-             (setf (elfeed-entry-tags e) tags)))))
+              (when (and api-cat (not (memq api-cat tags)))
+                (push api-cat tags))
+              (setf (elfeed-entry-meta e)
+                    (miniflux--plist-merge
+                     (miniflux--entry-meta api-entry
+                                           (or (assoc-default 'author api-entry) ""))
+                     (elfeed-entry-meta e)))
+              (setf (elfeed-entry-tags e) tags)))))
    api-table))
 
 (defun miniflux-sync ()
@@ -899,6 +907,57 @@ Flow:
     (when (memq miniflux-sync-failed-tag (elfeed-entry-tags entry))
       (setf (elfeed-entry-tags entry)
             (delq miniflux-sync-failed-tag (elfeed-entry-tags entry))))))
+
+(defun miniflux--entry-starred-p (entry)
+  "Return non-nil if ENTRY has the configured Miniflux star tag."
+  (memq miniflux-sync-star-tag (elfeed-entry-tags entry)))
+
+(defun miniflux--push-entry-state (entry)
+  "Push ENTRY's current unread/star state to Miniflux.
+Return non-nil when all remote updates succeeded.  Bookmark state is
+checked against the server before toggling because Miniflux exposes a
+toggle endpoint rather than an explicit set endpoint."
+  (let ((id (miniflux--entry-mf-id entry)))
+    (when id
+      (let* ((tags (elfeed-entry-tags entry))
+             (want-unread (not (null (memq 'unread tags))))
+             (want-starred (not (null (miniflux--entry-starred-p entry))))
+             (status-ok (miniflux-update-entry-status
+                         (list id) (if want-unread "unread" "read")))
+             (remote-entry (and status-ok (miniflux-get-entry id)))
+             (remote-starred (assoc-default 'starred remote-entry))
+             (star-ok (and remote-entry
+                           (or (eq want-starred remote-starred)
+                               (miniflux-toggle-entry-bookmark id)))))
+        (and status-ok star-ok)))))
+
+(defun miniflux-retry-sync-failed ()
+  "Retry pushing selected elfeed entries' local state to Miniflux.
+This is intended for entries tagged with `miniflux-sync-failed-tag', but
+it works on any selected Miniflux entries.  Entries that still fail keep
+the failure tag; successfully pushed entries have it removed."
+  (interactive nil elfeed-search-mode)
+  (miniflux--check-auth)
+  (let ((entries (miniflux--selected-entries))
+        (ok 0)
+        (failed 0))
+    (dolist (entry entries)
+      (condition-case err
+          (if (miniflux--push-entry-state entry)
+              (progn
+                (miniflux--clear-entries-sync-failed (list entry))
+                (setq ok (1+ ok)))
+            (miniflux--mark-entries-sync-failed (list entry))
+            (setq failed (1+ failed)))
+        (error
+         (miniflux--mark-entries-sync-failed (list entry))
+         (setq failed (1+ failed))
+         (message "Miniflux retry error: %s" (error-message-string err)))))
+    (elfeed-db-save)
+    (when (derived-mode-p 'elfeed-search-mode)
+      (elfeed-search-update :force))
+    (message "Miniflux: retried %d entr%s, %d succeeded, %d failed"
+             (+ ok failed) (if (= (+ ok failed) 1) "y" "ies") ok failed)))
 
 (defun miniflux-clear-sync-failed ()
   "Clear sync failure markers from selected elfeed entries."
@@ -1081,11 +1140,13 @@ NOT push — it only pulls from server."
     (define-key elfeed-search-mode-map "G" #'miniflux-search-refresh)
     (define-key elfeed-search-mode-map "M" #'miniflux-mark-current-feed-read)
     (define-key elfeed-search-mode-map "O" #'miniflux-open-entry-in-miniflux)
+    (define-key elfeed-search-mode-map "R" #'miniflux-retry-sync-failed)
     (when (fboundp 'evil-define-key)
       (evil-define-key 'normal elfeed-search-mode-map
         "G" #'miniflux-search-refresh
         "M" #'miniflux-mark-current-feed-read
-        "O" #'miniflux-open-entry-in-miniflux))))
+        "O" #'miniflux-open-entry-in-miniflux
+        "R" #'miniflux-retry-sync-failed))))
 
 (miniflux--setup-keybindings)
 

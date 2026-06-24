@@ -106,6 +106,7 @@ Add =miniflux.el= to your =load-path= and:
 | =M-x miniflux-show-category=               | Show entries from a Miniflux category tag             |
 | =M-x miniflux-show-feed=                   | Show entries from the selected entry's feed           |
 | =M-x miniflux-show-sync-failed=            | Show entries whose local push failed                  |
+| =M-x miniflux-retry-sync-failed=           | Retry pushing selected entries' local state           |
 | =M-x miniflux-clear-sync-failed=           | Clear failure markers from selected entries           |
 
 ** Keybindings in elfeed-search-mode
@@ -115,6 +116,7 @@ Add =miniflux.el= to your =load-path= and:
 | =G=   | Sync from Miniflux server and refresh (=miniflux-search-refresh=) |
 | =M=   | Mark current feed as read on Miniflux and sync                  |
 | =O=   | Open current entry in the Miniflux web UI                       |
+| =R=   | Retry pushing selected failed local changes                     |
 
 Standard elfeed keybindings continue to work and automatically sync
 back to Miniflux:
@@ -151,8 +153,11 @@ Sync is pull-only: the Miniflux server is the source of truth during
 elfeed tag hooks when you mark entries read/unread or add/remove the
 configured star tag.  If a push fails because of a network or server
 error, the entry receives =miniflux-sync-failed-tag= so you can inspect
-it with =M-x miniflux-show-sync-failed=.  The next successful sync will
-still treat the server as the source of truth.
+it with =M-x miniflux-show-sync-failed= or retry the selected entries
+with =M-x miniflux-retry-sync-failed=.  Retry checks the server-side
+bookmark state before toggling it, because Miniflux exposes bookmark
+changes as a toggle endpoint.  The next successful sync will still treat
+the server as the source of truth.
 
 =miniflux-sync-async= schedules a sync and returns immediately.  It uses
 the same sync pipeline as =miniflux-sync= and refreshes the elfeed search

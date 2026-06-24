@@ -121,6 +121,17 @@
       (should-not (nth 1 result))
       (should (= requests 1)))))
 
+(ert-deftest miniflux-fetch-entry-pages-async-uses-async-limit ()
+  (let ((miniflux-sync-limit 1000)
+        (miniflux-sync-pages-limit 1)
+        used-limit)
+    (cl-letf (((symbol-function 'miniflux--request-async)
+               (lambda (_method _path callback _data params)
+                 (setq used-limit (assoc-default "limit" params))
+                 (funcall callback '((total . 0) (entries . []))))))
+      (miniflux--fetch-entry-pages-async nil nil #'ignore)
+      (should (equal used-limit "100")))))
+
 (ert-deftest miniflux-reconcile-all-stars-uses-custom-star-tag ()
   (let* ((miniflux-sync-star-tag 'favorite)
          (elfeed-db-entries (make-hash-table :test 'equal))

@@ -394,6 +394,7 @@ When FULL-P is non-nil, continue until the API total is exhausted or
 (ENTRIES COMPLETE-P TOTAL OK-P)."
   (let ((offset 0)
         (page 0)
+        (limit (min miniflux-sync-limit 100))
         (entries nil)
         (total nil)
         (complete-p nil)
@@ -420,15 +421,15 @@ When FULL-P is non-nil, continue until the API total is exhausted or
                     (if (or (not full-p)
                             (not total)
                             (>= (length entries) total)
-                            (< (length page-entries) miniflux-sync-limit))
+                            (< (length page-entries) limit))
                         (progn
                           (setq complete-p (or (and total (>= (length entries) total))
-                                               (< (length page-entries) miniflux-sync-limit)))
+                                               (< (length page-entries) limit)))
                           (done))
                       (next)))))
               nil
               (miniflux--filters-to-params
-               (append filters (list :limit miniflux-sync-limit
+               (append filters (list :limit limit
                                      :offset offset)))))))
       (next))))
 

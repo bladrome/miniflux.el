@@ -302,18 +302,23 @@ Returns parsed JSON on success, t for 204, nil on error."
     (url-retrieve
      url
      (lambda (status)
-       (unwind-protect
-           (funcall callback
-                    (if (plist-get status :error)
-                        (progn
-                          (message "Miniflux async error: %S" (plist-get status :error))
-                          nil)
-                      (condition-case err
-                          (miniflux--parse-response)
-                        (error
-                         (message "Miniflux async parse error: %s" (error-message-string err))
-                         nil))))
-         (kill-buffer (current-buffer)))))))
+       (let ((buffer (current-buffer)))
+         (unwind-protect
+             (funcall callback
+                      (if (plist-get status :error)
+                          (progn
+                            (message "Miniflux async error: %S" (plist-get status :error))
+                            nil)
+                        (condition-case err
+                            (miniflux--parse-response)
+                          (error
+                           (message "Miniflux async parse error: %s" (error-message-string err))
+                           nil))))
+           (run-at-time 0.1 nil
+                        (lambda (buf)
+                          (when (buffer-live-p buf)
+                            (kill-buffer buf)))
+                        buffer)))))))
 
 ;;; ─── API: Feeds ───
 
@@ -327,19 +332,12 @@ Returns parsed JSON on success, t for 204, nil on error."
 
 (defun miniflux-get-feed-entries (id &rest filters)
   "Return entries for feed ID with FILTERS plist."
-  (let (params)
-    (while filters
-      (let ((key (pop filters)) (val (pop filters)))
-        (push (cons (substring (symbol-name key) 1) (format "%s" val)) params)))
-    (miniflux--request :GET (format "/feeds/%d/entries" id) nil params)))
+  (miniflux--request :GET (format "/feeds/%d/entries" id)
+                     nil (miniflux--filters-to-params filters)))
 
 (defun miniflux-get-entries (&rest filters)
   "Return entries with FILTERS plist."
-  (let (params)
-    (while filters
-      (let ((key (pop filters)) (val (pop filters)))
-        (push (cons (substring (symbol-name key) 1) (format "%s" val)) params)))
-    (miniflux--request :GET "/entries" nil params)))
+  (miniflux--request :GET "/entries" nil (miniflux--filters-to-params filters)))
 
 (defun miniflux--filters-to-params (filters)
   "Convert FILTERS plist to API query params."
@@ -691,6 +689,13 @@ FEED-ID-STR is the elfeed feed id."
       (miniflux--record-api-entry entry api-table api-starred-ids api-unread-ids)))
   (length entries))
 
+(defun miniflux--store-sync-result (result api-table api-starred-ids api-unread-ids)
+  "Store entries from fetch RESULT and return (COUNT COMPLETE-P OK-P)."
+  (list (miniflux--store-and-record-entries
+         (nth 0 result) api-table api-starred-ids api-unread-ids)
+        (nth 1 result)
+        (nth 3 result)))
+
 (defun miniflux--recent-sync-filters ()
   "Return filters for the recent entries sync batch."
   (append (list :order "published_at")
@@ -728,32 +733,18 @@ FEED-ID-STR is the elfeed feed id."
         (unread-batch-complete nil)
         (ok-count 0)
         (total-entries 0))
-    (let* ((recent-result (miniflux--fetch-entry-pages
-                           (miniflux--recent-sync-filters) nil))
-           (recent-entries (nth 0 recent-result)))
-      (when (nth 3 recent-result)
-        (setq ok-count (1+ ok-count)))
-      (setq total-entries (+ total-entries
-                             (miniflux--store-and-record-entries
-                              recent-entries api-table api-starred-ids api-unread-ids))))
-    (let* ((starred-result (miniflux--fetch-entry-pages
-                            (list :starred "1") miniflux-sync-full-starred))
-           (starred-entries (nth 0 starred-result)))
-      (setq starred-batch-complete (nth 1 starred-result)
-            total-entries (+ total-entries
-                             (miniflux--store-and-record-entries
-                              starred-entries api-table api-starred-ids api-unread-ids)))
-      (when (nth 3 starred-result)
-        (setq ok-count (1+ ok-count))))
-    (let* ((unread-result (miniflux--fetch-entry-pages
-                           (list :status "unread") miniflux-sync-full-unread))
-           (unread-entries (nth 0 unread-result)))
-      (setq unread-batch-complete (nth 1 unread-result)
-            total-entries (+ total-entries
-                             (miniflux--store-and-record-entries
-                              unread-entries api-table api-starred-ids api-unread-ids)))
-      (when (nth 3 unread-result)
-        (setq ok-count (1+ ok-count))))
+    (dolist (batch `((,(miniflux--recent-sync-filters) nil nil)
+                     ((:starred "1") ,miniflux-sync-full-starred starred)
+                     ((:status "unread") ,miniflux-sync-full-unread unread)))
+      (let* ((result (miniflux--fetch-entry-pages (nth 0 batch) (nth 1 batch)))
+             (stored (miniflux--store-sync-result
+                      result api-table api-starred-ids api-unread-ids)))
+        (setq total-entries (+ total-entries (nth 0 stored)))
+        (when (nth 2 stored)
+          (setq ok-count (1+ ok-count)))
+        (pcase (nth 2 batch)
+          ('starred (setq starred-batch-complete (nth 1 stored)))
+          ('unread (setq unread-batch-complete (nth 1 stored))))))
     (miniflux--finish-sync api-table api-starred-ids api-unread-ids
                            starred-batch-complete unread-batch-complete
                            ok-count total-entries)))
@@ -770,11 +761,13 @@ Call CALLBACK with the stored entry count on success, or nil on failure."
         (ok-count 0)
         (total-entries 0))
     (cl-labels
-        ((store (entries)
-           (setq total-entries
-                 (+ total-entries
-                    (miniflux--store-and-record-entries
-                     entries api-table api-starred-ids api-unread-ids))))
+        ((store-result (result)
+           (let ((stored (miniflux--store-sync-result
+                          result api-table api-starred-ids api-unread-ids)))
+             (setq total-entries (+ total-entries (nth 0 stored)))
+             (when (nth 2 stored)
+               (setq ok-count (1+ ok-count)))
+             (nth 1 stored)))
          (fail (err)
            (message "Miniflux async sync error: %s" (error-message-string err))
            (funcall callback nil))
@@ -791,10 +784,7 @@ Call CALLBACK with the stored entry count on success, or nil on failure."
             (lambda (result)
               (condition-case err
                   (progn
-                    (setq unread-batch-complete (nth 1 result))
-                    (store (nth 0 result))
-                    (when (nth 3 result)
-                      (setq ok-count (1+ ok-count)))
+                    (setq unread-batch-complete (store-result result))
                     (finish))
                 (error (fail err))))))
          (fetch-starred ()
@@ -803,10 +793,7 @@ Call CALLBACK with the stored entry count on success, or nil on failure."
             (lambda (result)
               (condition-case err
                   (progn
-                    (setq starred-batch-complete (nth 1 result))
-                    (store (nth 0 result))
-                    (when (nth 3 result)
-                      (setq ok-count (1+ ok-count)))
+                    (setq starred-batch-complete (store-result result))
                     (fetch-unread))
                 (error (fail err))))))
          (fetch-recent ()
@@ -815,9 +802,7 @@ Call CALLBACK with the stored entry count on success, or nil on failure."
             (lambda (result)
               (condition-case err
                   (progn
-                    (store (nth 0 result))
-                    (when (nth 3 result)
-                      (setq ok-count (1+ ok-count)))
+                    (store-result result)
                     (fetch-starred))
                 (error (fail err)))))))
       (fetch-recent))))
@@ -1177,6 +1162,27 @@ the failure tag; successfully pushed entries have it removed."
 
 ;;; ─── Tag sync hooks (elfeed → Miniflux) ───
 
+(defun miniflux--entry-mf-ids (entries)
+  "Return Miniflux numeric IDs for ENTRIES."
+  (delq nil (mapcar #'miniflux--entry-mf-id entries)))
+
+(defun miniflux--push-entries-status (entries status)
+  "Push STATUS for Miniflux ENTRIES and update failure tags."
+  (let ((ids (miniflux--entry-mf-ids entries)))
+    (when ids
+      (if (miniflux-update-entry-status ids status)
+          (miniflux--clear-entries-sync-failed entries)
+        (miniflux--mark-entries-sync-failed entries)))))
+
+(defun miniflux--toggle-entries-bookmark (entries)
+  "Toggle Miniflux bookmark state for ENTRIES and update failure tags."
+  (dolist (entry entries)
+    (let ((mf-id (miniflux--entry-mf-id entry)))
+      (when mf-id
+        (if (miniflux-toggle-entry-bookmark mf-id)
+            (miniflux--clear-entries-sync-failed (list entry))
+          (miniflux--mark-entries-sync-failed (list entry)))))))
+
 (defun miniflux--tag-hook (entries tags)
   "Push tag additions from elfeed to Miniflux in real-time.
 Called via `elfeed-tag-hook' when the user adds tags (e.g. + star).
@@ -1185,18 +1191,9 @@ NOT push — it only pulls from server."
   (condition-case err
       (progn
         (when (memq 'unread tags)
-          (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
-            (when ids
-              (if (miniflux-update-entry-status ids "unread")
-                  (miniflux--clear-entries-sync-failed entries)
-                (miniflux--mark-entries-sync-failed entries)))))
+          (miniflux--push-entries-status entries "unread"))
         (when (memq miniflux-sync-star-tag tags)
-          (dolist (entry entries)
-            (let ((mf-id (miniflux--entry-mf-id entry)))
-              (when mf-id
-                (if (miniflux-toggle-entry-bookmark mf-id)
-                    (miniflux--clear-entries-sync-failed (list entry))
-                  (miniflux--mark-entries-sync-failed (list entry))))))))
+          (miniflux--toggle-entries-bookmark entries)))
     (error
      (miniflux--mark-entries-sync-failed entries)
      (message "Miniflux tag-hook error: %s" (error-message-string err)))))
@@ -1209,18 +1206,9 @@ NOT push — it only pulls from server."
   (condition-case err
       (progn
         (when (memq 'unread tags)
-          (let ((ids (delq nil (mapcar #'miniflux--entry-mf-id entries))))
-            (when ids
-              (if (miniflux-update-entry-status ids "read")
-                  (miniflux--clear-entries-sync-failed entries)
-                (miniflux--mark-entries-sync-failed entries)))))
+          (miniflux--push-entries-status entries "read"))
         (when (memq miniflux-sync-star-tag tags)
-          (dolist (entry entries)
-            (let ((mf-id (miniflux--entry-mf-id entry)))
-              (when mf-id
-                (if (miniflux-toggle-entry-bookmark mf-id)
-                    (miniflux--clear-entries-sync-failed (list entry))
-                  (miniflux--mark-entries-sync-failed (list entry))))))))
+          (miniflux--toggle-entries-bookmark entries)))
     (error
      (miniflux--mark-entries-sync-failed entries)
      (message "Miniflux untag-hook error: %s" (error-message-string err)))))

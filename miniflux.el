@@ -515,7 +515,8 @@ When FULL-P is non-nil, continue until the API total is exhausted or
 
 (defun miniflux--category-tag-p (tag)
   "Return non-nil if TAG is managed by miniflux category sync."
-  (string-prefix-p miniflux-category-tag-prefix (symbol-name tag)))
+  (and (not (string-empty-p miniflux-category-tag-prefix))
+       (string-prefix-p miniflux-category-tag-prefix (symbol-name tag))))
 
 (defun miniflux--entry-category-tag (entry)
   "Return the Miniflux category title for ENTRY as a symbol, or nil."

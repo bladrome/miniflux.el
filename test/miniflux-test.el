@@ -39,6 +39,11 @@
     (should (eq (miniflux--entry-category-tag entry)
                 'miniflux-category-tech-news))))
 
+(ert-deftest miniflux-category-tag-p-ignores-empty-prefix ()
+  (let ((miniflux-category-tag-prefix ""))
+    (should-not (miniflux--category-tag-p 'unread))
+    (should-not (miniflux--category-tag-p 'blog))))
+
 (ert-deftest miniflux-entry-meta-is-plist ()
   (let* ((entry '((id . 7806)
                   (author . "Mitchell")
@@ -156,7 +161,8 @@
     (should-not (memq 'unread (elfeed-entry-tags entry)))))
 
 (ert-deftest miniflux-reconcile-entry-tags-preserves-user-tags ()
-  (let* ((elfeed-db-entries (make-hash-table :test 'equal))
+  (let* ((miniflux-category-tag-prefix "miniflux-category-")
+         (elfeed-db-entries (make-hash-table :test 'equal))
          (api-table (make-hash-table :test 'equal))
          (id (cons 'miniflux "1"))
          (entry (elfeed-entry--create :id id
@@ -177,7 +183,8 @@
                    "Tech News"))))
 
 (ert-deftest miniflux-reconcile-entry-tags-removes-stale-category-tags ()
-  (let* ((elfeed-db-entries (make-hash-table :test 'equal))
+  (let* ((miniflux-category-tag-prefix "miniflux-category-")
+         (elfeed-db-entries (make-hash-table :test 'equal))
          (api-table (make-hash-table :test 'equal))
          (id (cons 'miniflux "1"))
          (entry (elfeed-entry--create :id id
@@ -189,6 +196,20 @@
     (should-not (memq 'miniflux-category-old (elfeed-entry-tags entry)))
     (should (memq 'custom (elfeed-entry-tags entry)))
     (should (memq 'miniflux-category-new (elfeed-entry-tags entry)))))
+
+(ert-deftest miniflux-reconcile-entry-tags-preserves-unread-with-empty-prefix ()
+  (let* ((miniflux-category-tag-prefix "")
+         (elfeed-db-entries (make-hash-table :test 'equal))
+         (api-table (make-hash-table :test 'equal))
+         (id (cons 'miniflux "1"))
+         (entry (elfeed-entry--create :id id
+                                      :title "t"
+                                      :tags '(unread blog))))
+    (puthash id entry elfeed-db-entries)
+    (puthash id '((feed . ((category . ((title . "Blog")))))) api-table)
+    (miniflux--reconcile-entry-tags api-table)
+    (should (memq 'unread (elfeed-entry-tags entry)))
+    (should (memq 'blog (elfeed-entry-tags entry)))))
 
 (ert-deftest miniflux-push-entry-state-toggles-star-only-when-needed ()
   (let* ((entry (elfeed-entry--create :id (cons 'miniflux "7")

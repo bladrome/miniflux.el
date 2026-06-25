@@ -349,42 +349,6 @@ Returns parsed JSON on success, t for 204, nil on error."
           (push (cons (substring (symbol-name key) 1) (format "%s" val)) params))))
     (nreverse params)))
 
-(defun miniflux--fetch-entry-pages (filters full-p)
-  "Fetch entry pages matching FILTERS.
-When FULL-P is non-nil, continue until the API total is exhausted or
-`miniflux-sync-pages-limit' is reached.  Return (ENTRIES COMPLETE-P TOTAL OK-P)."
-  (let ((offset 0)
-        (page 0)
-        (entries nil)
-        (total nil)
-        (complete-p nil)
-        (ok-p nil)
-        data page-entries)
-    (while (and (or (= page 0)
-                    (and full-p total (< (length entries) total)))
-                (< page miniflux-sync-pages-limit))
-      (setq data (miniflux--request
-                  :GET "/entries" nil
-                  (miniflux--filters-to-params
-                   (append filters (list :limit miniflux-sync-limit
-                                         :offset offset)))))
-      (setq page (1+ page))
-      (if (not data)
-          (setq page miniflux-sync-pages-limit)
-        (setq ok-p t)
-        (setq page-entries (append (assoc-default 'entries data) nil)
-              total (assoc-default 'total data)
-              entries (append entries page-entries)
-              offset (+ offset (length page-entries)))
-        (when (or (not full-p)
-                  (not total)
-                  (>= (length entries) total)
-                  (< (length page-entries) miniflux-sync-limit))
-          (setq complete-p (or (and total (>= (length entries) total))
-                               (< (length page-entries) miniflux-sync-limit))
-                page miniflux-sync-pages-limit))))
-    (list entries complete-p total ok-p)))
-
 (defun miniflux--fetch-entry-pages-async (filters full-p callback)
   "Fetch entry pages matching FILTERS asynchronously.
 When FULL-P is non-nil, continue until the API total is exhausted or
@@ -723,32 +687,6 @@ FEED-ID-STR is the elfeed feed id."
     (message "Miniflux: no entries found (check server/credentials)"))
   total-entries)
 
-(defun miniflux--perform-sync ()
-  "Perform the Miniflux -> elfeed sync and return number of stored entries."
-  (message "Miniflux: syncing...")
-  (let ((api-table (make-hash-table :test 'equal))
-        (api-starred-ids (make-hash-table :test 'equal))
-        (api-unread-ids (make-hash-table :test 'equal))
-        (starred-batch-complete nil)
-        (unread-batch-complete nil)
-        (ok-count 0)
-        (total-entries 0))
-    (dolist (batch `((,(miniflux--recent-sync-filters) nil nil)
-                     ((:starred "1") ,miniflux-sync-full-starred starred)
-                     ((:status "unread") ,miniflux-sync-full-unread unread)))
-      (let* ((result (miniflux--fetch-entry-pages (nth 0 batch) (nth 1 batch)))
-             (stored (miniflux--store-sync-result
-                      result api-table api-starred-ids api-unread-ids)))
-        (setq total-entries (+ total-entries (nth 0 stored)))
-        (when (nth 2 stored)
-          (setq ok-count (1+ ok-count)))
-        (pcase (nth 2 batch)
-          ('starred (setq starred-batch-complete (nth 1 stored)))
-          ('unread (setq unread-batch-complete (nth 1 stored))))))
-    (miniflux--finish-sync api-table api-starred-ids api-unread-ids
-                           starred-batch-complete unread-batch-complete
-                           ok-count total-entries)))
-
 (defun miniflux--perform-sync-async (callback)
   "Perform the Miniflux -> elfeed sync asynchronously.
 Call CALLBACK with the stored entry count on success, or nil on failure."
@@ -915,11 +853,16 @@ Uses direct (setf elfeed-entry-tags) -> no elfeed hooks are triggered."
               (setf (elfeed-entry-tags e) tags)))))
    api-table))
 
-(defun miniflux-sync ()
+(defun miniflux-sync (&optional callback)
   "Sync entries from Miniflux server into elfeed's database.
 
 Sync is PULL-ONLY — the server is the single source of truth.
-Local→server pushes happen in real-time via elfeed tag hooks
+
+Sync runs ASYNCHRONOUSLY via url.el's non-blocking HTTP requests, so
+Emacs stays responsive while the server is contacted.  CALLBACK, if
+non-nil, is invoked with the number of synced entries (or nil on
+failure) once sync completes.  Local->server pushes happen in
+real-time via elfeed tag hooks
 (see `miniflux--tag-hook' / `miniflux--untag-hook').
 
 Flow:
@@ -940,31 +883,25 @@ Flow:
   (when miniflux--sync-in-progress
     (user-error "Sync already in progress"))
   (setq miniflux--sync-in-progress t)
-  (unwind-protect
-      (miniflux--perform-sync)
-    (setq miniflux--sync-in-progress nil)))
-
-(defun miniflux-sync-async ()
-  "Start a non-blocking Miniflux sync and return immediately."
-  (interactive)
-  (miniflux--check-auth)
-  (miniflux--ensure-elfeed)
-  (miniflux--install-hooks)
-  (when miniflux--sync-in-progress
-    (user-error "Sync already in progress"))
-  (setq miniflux--sync-in-progress t)
   (condition-case err
       (miniflux--perform-sync-async
-       (lambda (_total)
+       (lambda (total)
          (unwind-protect
-             (when (get-buffer (elfeed-search-buffer))
-               (with-current-buffer (elfeed-search-buffer)
-                 (elfeed-search-update :force)))
+             (when (and callback (functionp callback))
+               (funcall callback total))
            (setq miniflux--sync-in-progress nil))))
     (error
      (setq miniflux--sync-in-progress nil)
      (signal (car err) (cdr err))))
   (message "Miniflux: async sync started"))
+
+(defun miniflux-sync-async ()
+  "Start a non-blocking Miniflux sync and return immediately.
+This is now an alias for `miniflux-sync' (which is asynchronous) plus
+a refresh of the elfeed search buffer on completion.  Kept for
+backward compatibility."
+  (interactive)
+  (miniflux-sync #'miniflux--refresh-search-maybe))
 
 (defun miniflux--entry-mf-id (entry)
   "Get the Miniflux numeric ID from an elfeed ENTRY, or nil."
@@ -1223,11 +1160,19 @@ NOT push — it only pulls from server."
   "Return the elfeed untag hook symbol for this elfeed version."
   (if (boundp 'elfeed-untag-hook) 'elfeed-untag-hook 'elfeed-untag-hooks))
 
+(defun miniflux--refresh-search-maybe (_total)
+  "Refresh the elfeed search buffer if it currently exists.
+Intended as a `miniflux-sync' completion callback."
+  (when (get-buffer (elfeed-search-buffer))
+    (with-current-buffer (elfeed-search-buffer)
+      (elfeed-search-update :force))))
+
 (defun miniflux-search-refresh ()
-  "Sync from Miniflux server and refresh elfeed search buffer."
+  "Sync from Miniflux server and refresh elfeed search buffer.
+Sync runs asynchronously; the search buffer is refreshed when it
+finishes, so Emacs stays responsive."
   (interactive nil elfeed-search-mode)
-  (miniflux-sync)
-  (elfeed-search-update :force))
+  (miniflux-sync #'miniflux--refresh-search-maybe))
 
 (defun miniflux--install-hooks ()
   "Install tag sync hooks and keybindings."
@@ -1258,11 +1203,11 @@ NOT push — it only pulls from server."
 ;;; ─── Entry point ───
 
 (defun miniflux ()
-  "Sync from Miniflux server and open elfeed search buffer."
+  "Sync from Miniflux server and open elfeed search buffer.
+Sync runs in the background; the search buffer is refreshed
+automatically when the sync finishes."
   (interactive)
-  (miniflux--check-auth)
-  (miniflux--install-hooks)
-  (miniflux-sync)
+  (miniflux-sync #'miniflux--refresh-search-maybe)
   (miniflux--ensure-elfeed)
   (let ((elfeed-feeds nil))
     (elfeed-search))

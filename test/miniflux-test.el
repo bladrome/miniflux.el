@@ -20,6 +20,48 @@
     (should (equal (miniflux--auth-headers)
                    '(("X-Auth-Token" . "token"))))))
 
+(ert-deftest miniflux-auth-headers-uses-basic-auth ()
+  (let ((miniflux-token "")
+        (miniflux-username "user")
+        (miniflux-password "pass"))
+    (should (equal (miniflux--auth-headers)
+                   `(("Authorization" . ,(concat "Basic "
+                                                  (base64-encode-string "user:pass" t))))))))
+
+(ert-deftest miniflux-auth-headers-uses-auth-source-token ()
+  (let ((miniflux-server "https://reader.example.com")
+        (miniflux-token "")
+        (miniflux-username "")
+        (miniflux-password ""))
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest _args)
+                 (list (list :user "token"
+                             :secret (lambda () "secret-token"))))))
+      (should (equal (miniflux--auth-headers)
+                     '(("X-Auth-Token" . "secret-token")))))))
+
+(ert-deftest miniflux-auth-headers-uses-auth-source-basic-auth ()
+  (let ((miniflux-server "https://reader.example.com")
+        (miniflux-token "")
+        (miniflux-username "")
+        (miniflux-password ""))
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest _args)
+                 (list (list :user "alice" :secret "s3cret")))))
+      (should (equal (miniflux--auth-headers)
+                     `(("Authorization" . ,(concat "Basic "
+                                                    (base64-encode-string "alice:s3cret" t)))))))))
+
+(ert-deftest miniflux-check-auth-accepts-auth-source ()
+  (let ((miniflux-server "https://reader.example.com")
+        (miniflux-token "")
+        (miniflux-username "")
+        (miniflux-password ""))
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest _args)
+                 (list (list :user "token" :secret "secret-token")))))
+      (should (miniflux--check-auth)))))
+
 (ert-deftest miniflux-request-url-encodes-params ()
   (let ((miniflux-server "https://example.com"))
     (should (equal (miniflux--request-url "/entries" '(("status" . "unread")
@@ -29,6 +71,22 @@
 (ert-deftest miniflux-json-error-message-extracts-message ()
   (should (equal (miniflux--json-error-message "{\"error_message\":\"bad token\"}")
                  "bad token")))
+
+(ert-deftest miniflux-parse-response-returns-nil-for-http-error ()
+  (with-temp-buffer
+    (insert "HTTP/1.1 401 Unauthorized\r\n\r\n{\"error_message\":\"bad token\"}")
+    (goto-char (point-min))
+    (should-not (miniflux--parse-response))))
+
+(ert-deftest miniflux-get-counters-parses-numeric-feed-ids ()
+  (cl-letf (((symbol-function 'miniflux--request)
+             (lambda (_method _path)
+               (list (cons 'unreads
+                           (list (cons (intern "42") 5)
+                                 (cons (intern "invalid") 9)
+                                 (cons (intern "7") 2)))))))
+    (should (equal (miniflux--get-counters)
+                   '((42 . 5) (7 . 2))))))
 
 (ert-deftest miniflux-slugify-trims-dashes ()
   (should (equal (miniflux--slugify "  Tech & News!  ") "tech-news")))
@@ -151,6 +209,24 @@
          (entry (elfeed-entry--create :id id :title "t" :tags '(star))))
     (puthash id entry elfeed-db-entries)
     (should (= (miniflux--reconcile-all-stars api-starred-ids nil) 0))
+    (should (memq 'star (elfeed-entry-tags entry)))))
+
+(ert-deftest miniflux-reconcile-stars-complete-batch-removes-missing ()
+  (let* ((elfeed-db-entries (make-hash-table :test 'equal))
+         (api-starred-ids (make-hash-table :test 'equal))
+         (id (cons 'miniflux "1"))
+         (entry (elfeed-entry--create :id id :title "t" :tags '(star))))
+    (puthash id entry elfeed-db-entries)
+    (should (= (miniflux--reconcile-all-stars api-starred-ids t) 1))
+    (should-not (memq 'star (elfeed-entry-tags entry)))))
+
+(ert-deftest miniflux-reconcile-stars-ignores-non-miniflux-entries ()
+  (let* ((elfeed-db-entries (make-hash-table :test 'equal))
+         (api-starred-ids (make-hash-table :test 'equal))
+         (id "https://example.com/post")
+         (entry (elfeed-entry--create :id id :title "t" :tags '(star))))
+    (puthash id entry elfeed-db-entries)
+    (should (= (miniflux--reconcile-all-stars api-starred-ids t) 0))
     (should (memq 'star (elfeed-entry-tags entry)))))
 
 (ert-deftest miniflux-reconcile-unread-incomplete-batch-does-not-remove ()

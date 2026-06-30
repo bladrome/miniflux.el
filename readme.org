@@ -45,10 +45,10 @@ of read/unread and starred status.
 
 ** Manual
 
-Add =miniflux.el= to your =load-path= and:
+Add the cloned repository directory to your =load-path= and require the package:
 
 #+begin_src emacs-lisp
-(add-to-list 'load-path "/path/to/miniflux.el")
+(add-to-list 'load-path "/path/to/miniflux.el/")
 (require 'miniflux)
 #+end_src
 
@@ -57,9 +57,9 @@ Add =miniflux.el= to your =load-path= and:
 | Variable                         | Default                  | Description                                         |
 |----------------------------------+--------------------------+-----------------------------------------------------|
 | =miniflux-server=                  | ="https://example.com"=    | Base URL of your Miniflux instance                  |
-| =miniflux-token=                   | =""=                       | API token (preferred auth method)                   |
-| =miniflux-username=                | =""=                       | Username for HTTP Basic Auth                        |
-| =miniflux-password=                | =""=                       | Password for HTTP Basic Auth                        |
+| =miniflux-token=                   | =""=                       | API token; preferred over other auth sources        |
+| =miniflux-username=                | =""=                       | Username for explicit HTTP Basic Auth               |
+| =miniflux-password=                | =""=                       | Password for explicit HTTP Basic Auth               |
 | =miniflux-sync-limit=              | =200=                      | Max entries fetched per sync page                   |
 | =miniflux-sync-star-tag=           | =star=                     | elfeed tag used for starred/bookmarked entries      |
 | =miniflux-sync-failed-tag=         | =miniflux-sync-failed=     | tag added when a local push to Miniflux fails       |
@@ -67,7 +67,7 @@ Add =miniflux.el= to your =load-path= and:
 | =miniflux-sync-full-starred=       | =t=                        | fetch all starred pages up to the page limit        |
 | =miniflux-sync-pages-limit=        | =20=                       | maximum pages fetched for unread/starred queries    |
 | =miniflux-sync-incremental=        | =t=                        | fetch recent entries changed since last sync        |
-| =miniflux-category-tag-prefix=     | ="miniflux-category-"=     | prefix for category tags managed by miniflux.el     |
+| =miniflux-category-tag-prefix=     | =""=                       | optional prefix for managed category tags           |
 | =miniflux-web-entry-path=          | ="/unread/entry/%d"=       | Miniflux web URL path format for an entry           |
 | =miniflux-web-feed-path=           | ="/feeds/%d/entries"=      | Miniflux web URL path format for a feed             |
 
@@ -84,6 +84,23 @@ Add =miniflux.el= to your =load-path= and:
 (setq miniflux-server "https://miniflux.mydomain.com")
 (setq miniflux-username "admin")
 (setq miniflux-password "s3cret")
+#+end_src
+
+** Example (auth-source)
+
+When =miniflux-token= is empty and explicit username/password are unset,
+=miniflux.el= looks up credentials for the host in =auth-source=.  Use a
+login of =token=, =api-token=, or =miniflux-token= to send the secret as an
+=X-Auth-Token= header:
+
+#+begin_src authinfo
+machine miniflux.mydomain.com login token password my-secret-api-token
+#+end_src
+
+Any other login is treated as the username for HTTP Basic Auth:
+
+#+begin_src authinfo
+machine miniflux.mydomain.com login admin password s3cret
 #+end_src
 
 * Usage
@@ -140,9 +157,11 @@ back to Miniflux:
    elfeed database.
 3. Reconciles local elfeed read/unread and star tags to match the
    server-side state when the server-side batch is known to be complete.
-4. Reconciles Miniflux category tags.  Managed category tags use the
-   =miniflux-category-tag-prefix= namespace so stale category tags can
-   be removed without touching user tags.
+4. Reconciles Miniflux category tags.  With the default empty
+   =miniflux-category-tag-prefix=, categories are added as bare slug tags
+   and stale category tags are not pruned.  Set a non-empty prefix such as
+   ="miniflux-category-"= to manage category tags in that namespace while
+   preserving unrelated user tags.
 5. Stores Miniflux IDs, category information, and feed details in entry
    metadata where elfeed can preserve them locally.
 6. Saves the elfeed database and records =miniflux-last-sync-time= for

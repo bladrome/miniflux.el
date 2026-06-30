@@ -34,6 +34,7 @@
 
 (require 'cl-lib)
 (require 'browse-url)
+(require 'auth-source)
 (require 'gv)
 (require 'json)
 (require 'parse-time)
@@ -187,16 +188,53 @@ unrelated user tags."
   (let ((base (directory-file-name miniflux-server)))
     (concat base (if (string-suffix-p "/v1" base) "" "/v1") path)))
 
+(defun miniflux--auth-source-host ()
+  "Return host name from `miniflux-server' for auth-source lookup."
+  (url-host (url-generic-parse-url miniflux-server)))
+
+(defun miniflux--auth-source-secret (secret)
+  "Return auth-source SECRET as a string."
+  (if (functionp secret) (funcall secret) secret))
+
+(defun miniflux--auth-source-credentials ()
+  "Return (USER . SECRET) credentials from auth-source, or nil."
+  (let* ((host (miniflux--auth-source-host))
+         (match (and host
+                     (car (auth-source-search :host host
+                                              :max 1
+                                              :require '(:secret)))))
+         (user (plist-get match :user))
+         (secret (miniflux--auth-source-secret (plist-get match :secret))))
+    (when (and user secret (not (string-empty-p secret)))
+      (cons user secret))))
+
+(defun miniflux--auth-source-token-user-p (user)
+  "Return non-nil when auth-source USER denotes an API token."
+  (member (downcase user) '("token" "api-token" "miniflux-token")))
+
+(defun miniflux--basic-auth-header (username password)
+  "Return a Basic Auth header for USERNAME and PASSWORD."
+  `("Authorization" . ,(concat "Basic "
+                                (base64-encode-string
+                                 (concat username ":" password)
+                                 t))))
+
 (defun miniflux--auth-headers ()
   "Return authentication headers."
-  (if (not (string-empty-p miniflux-token))
-      `(("X-Auth-Token" . ,miniflux-token))
-    (when (and (not (string-empty-p miniflux-username))
-               (not (string-empty-p miniflux-password)))
-      `(("Authorization" . ,(concat "Basic "
-                                    (base64-encode-string
-                                     (concat miniflux-username ":" miniflux-password)
-                                     t)))))))
+  (cond
+   ((not (string-empty-p miniflux-token))
+    `(("X-Auth-Token" . ,miniflux-token)))
+   ((and (not (string-empty-p miniflux-username))
+         (not (string-empty-p miniflux-password)))
+    (list (miniflux--basic-auth-header miniflux-username miniflux-password)))
+   (t
+    (let ((credentials (miniflux--auth-source-credentials)))
+      (when credentials
+        (let ((user (car credentials))
+              (secret (cdr credentials)))
+          (if (miniflux--auth-source-token-user-p user)
+              `(("X-Auth-Token" . ,secret))
+            (list (miniflux--basic-auth-header user secret)))))))))
 
 (defun miniflux--http-status ()
   "Extract HTTP status code from the current URL buffer."
@@ -439,19 +477,20 @@ When FULL-P is non-nil, continue until the API total is exhausted or
   "Return alist of (feed-id . unread-count) for all feeds."
   (let ((data (miniflux--request :GET "/feeds/counters")))
     (when data
-      (let ((fixer (lambda (x) (cons (read (symbol-name (car x))) (cdr x)))))
-        (mapcar fixer (assoc-default 'unreads data))))))
+      (delq nil
+            (mapcar (lambda (x)
+                      (let ((feed-id (symbol-name (car x))))
+                        (when (string-match-p "\\`[0-9]+\\'" feed-id)
+                          (cons (string-to-number feed-id) (cdr x)))))
+                    (assoc-default 'unreads data))))))
 
 ;;; ─── Elfeed integration ───
 
 (defun miniflux--check-auth ()
   "Check auth config and return t if OK."
-  (cond
-   ((not (string-empty-p miniflux-token)) t)
-   ((and (not (string-empty-p miniflux-username))
-         (not (string-empty-p miniflux-password))) t)
-   (t
-    (user-error "Set `miniflux-token' or `miniflux-username' + `miniflux-password'"))))
+  (if (miniflux--auth-headers)
+      t
+    (user-error "Set `miniflux-token', `miniflux-username' + `miniflux-password', or auth-source credentials")))
 
 (defun miniflux--feed-url (feed-id)
   "Build a unique elfeed feed-id for Miniflux feed FEED-ID (number)."

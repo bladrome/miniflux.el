@@ -47,11 +47,13 @@
 (declare-function elfeed-search-selected "elfeed-search")
 (declare-function elfeed-search-set-filter "elfeed-search")
 (declare-function elfeed-search-update "elfeed-search")
+(declare-function elfeed-search--column-tags "elfeed-search")
 (declare-function elfeed-db-add "elfeed-db")
 (declare-function elfeed-db-ensure "elfeed-db")
 (declare-function elfeed-db-save "elfeed-db")
 (declare-function elfeed-entry--create "elfeed-db")
 (declare-function elfeed-feed--create "elfeed-db")
+(declare-function elfeed-feed-title "elfeed-db")
 
 (defun miniflux--ensure-elfeed ()
   "Ensure elfeed is loaded and available."
@@ -163,6 +165,18 @@ still uses their dedicated queries."
 Using a namespace lets sync replace stale category tags without touching
 unrelated user tags."
   :type '(string)
+  :group 'miniflux)
+
+(defcustom miniflux-feed-tag-prefix ""
+  "Prefix used for Miniflux feed title tags in elfeed."
+  :type '(string)
+  :group 'miniflux)
+
+(defcustom miniflux-hide-feed-tags-in-search t
+  "Non-nil means hide Miniflux feed title tags in elfeed search rows.
+The tags stay on entries, so `+' and `-' search filters still complete
+and match feed names."
+  :type '(boolean)
   :group 'miniflux)
 
 (defcustom miniflux-web-entry-path "/unread/entry/%d"
@@ -520,6 +534,11 @@ When FULL-P is non-nil, continue until the API total is exhausted or
   (and (not (string-empty-p miniflux-category-tag-prefix))
        (string-prefix-p miniflux-category-tag-prefix (symbol-name tag))))
 
+(defun miniflux--feed-tag-p (tag)
+  "Return non-nil if TAG is managed by miniflux feed sync."
+  (and (not (string-empty-p miniflux-feed-tag-prefix))
+       (string-prefix-p miniflux-feed-tag-prefix (symbol-name tag))))
+
 (defun miniflux--entry-category-tag (entry)
   "Return the Miniflux category title for ENTRY as a symbol, or nil."
   (let* ((feed-data (assoc-default 'feed entry))
@@ -527,6 +546,45 @@ When FULL-P is non-nil, continue until the API total is exhausted or
          (cat-title (assoc-default 'title category)))
     (when (and cat-title (not (string-empty-p cat-title)))
       (intern (concat miniflux-category-tag-prefix (miniflux--slugify cat-title))))))
+
+(defun miniflux--entry-feed-tag (entry)
+  "Return the Miniflux feed title for ENTRY as a symbol, or nil."
+  (let* ((feed-data (assoc-default 'feed entry))
+         (feed-title (assoc-default 'title feed-data)))
+    (when (and feed-title (not (string-empty-p feed-title)))
+      (intern (concat miniflux-feed-tag-prefix (miniflux--slugify feed-title))))))
+
+(defun miniflux--elfeed-entry-feed-tag (entry)
+  "Return the Miniflux feed title tag for elfeed ENTRY, or nil."
+  (when-let* ((feed-title (or (plist-get (elfeed-entry-meta entry)
+                                         :miniflux-feed-title)
+                              (when-let* ((feed (elfeed-entry-feed entry)))
+                                (elfeed-feed-title feed)))))
+    (when (not (string-empty-p feed-title))
+      (intern (concat miniflux-feed-tag-prefix (miniflux--slugify feed-title))))))
+
+(defun miniflux--search-visible-tags (entry)
+  "Return ENTRY tags after applying Miniflux search display options."
+  (let ((tags (copy-sequence (elfeed-entry-tags entry)))
+        (feed-tag (miniflux--elfeed-entry-feed-tag entry)))
+    (if (and miniflux-hide-feed-tags-in-search feed-tag)
+        (delq feed-tag tags)
+      tags)))
+
+(defun miniflux--search-column-tags (orig entry)
+  "Like ORIG for ENTRY, but optionally hide Miniflux feed title tags."
+  (if (not miniflux-hide-feed-tags-in-search)
+      (funcall orig entry)
+    (when-let* ((tags (miniflux--search-visible-tags entry)))
+      (concat " ("
+              (mapconcat
+               (lambda (tag)
+                 (propertize (symbol-name tag)
+                             'face 'elfeed-search-tag-face
+                             'mouse-face 'highlight 'elfeed-tag tag
+                             'follow-link [elfeed-tag]))
+               tags ",")
+              ")"))))
 
 (defun miniflux--feed-meta (feed-data)
   "Build elfeed feed metadata from Miniflux FEED-DATA."
@@ -564,6 +622,8 @@ When FULL-P is non-nil, continue until the API total is exhausted or
       :miniflux-id ,(assoc-default 'id entry)
       ,@(when (assoc-default 'id feed-data)
           (list :miniflux-feed-id (assoc-default 'id feed-data)))
+      ,@(when (assoc-default 'title feed-data)
+          (list :miniflux-feed-title (assoc-default 'title feed-data)))
       ,@(when (assoc-default 'id category)
           (list :miniflux-category-id (assoc-default 'id category)))
       ,@(when (assoc-default 'title category)
@@ -589,20 +649,22 @@ FEED-ID-STR is the elfeed feed id string (e.g. \"miniflux://5\")."
          (starred (assoc-default 'starred entry))
          (entry-id (cons 'miniflux (format "%d" mf-id)))
          (cat-tag (miniflux--entry-category-tag entry))
+         (feed-tag (miniflux--entry-feed-tag entry))
          (tags (delq nil
                      (list (when (equal status "unread") 'unread)
                            (when (eq t starred) miniflux-sync-star-tag)
-                           cat-tag))))
+                           cat-tag
+                           feed-tag))))
     (elfeed-entry--create
      :id entry-id
      :title title
      :link link
      :date date
-      :content content
-      :content-type 'html
-      :tags tags
-      :feed-id feed-id-str
-      :meta (miniflux--entry-meta entry author))))
+     :content content
+     :content-type 'html
+     :tags tags
+     :feed-id feed-id-str
+     :meta (miniflux--entry-meta entry author))))
 
 (defun miniflux--sync-entries (data feed-id-str)
   "Convert DATA entries and add them to the elfeed database.
@@ -871,25 +933,29 @@ Uses direct (setf elfeed-entry-tags) -> no elfeed hooks are triggered."
   (maphash
    (lambda (id api-entry)
      (let* ((api-cat (miniflux--entry-category-tag api-entry))
+            (api-feed (miniflux--entry-feed-tag api-entry))
             (e (gethash id elfeed-db-entries)))
        (when e
-          ;; Fix titles with newlines
-          (let ((title (elfeed-entry-title e)))
-            (when (string-match-p "[\n\r]" title)
-              (setf (elfeed-entry-title e)
-                    (replace-regexp-in-string "[\n\r]+" " " title))))
-           ;; Replace stale miniflux category tags without touching user tags.
-           (let* ((tags (elfeed-entry-tags e))
-                  (tags (cl-remove-if #'miniflux--category-tag-p
-                                      (copy-sequence tags))))
-              (when (and api-cat (not (memq api-cat tags)))
-                (push api-cat tags))
-              (setf (elfeed-entry-meta e)
-                    (miniflux--plist-merge
-                     (miniflux--entry-meta api-entry
-                                           (or (assoc-default 'author api-entry) ""))
-                     (elfeed-entry-meta e)))
-              (setf (elfeed-entry-tags e) tags)))))
+         ;; Fix titles with newlines
+         (let ((title (elfeed-entry-title e)))
+           (when (string-match-p "[\n\r]" title)
+             (setf (elfeed-entry-title e)
+                   (replace-regexp-in-string "[\n\r]+" " " title))))
+         ;; Replace stale miniflux category tags without touching user tags.
+         (let* ((tags (elfeed-entry-tags e))
+                (tags (cl-remove-if #'miniflux--category-tag-p
+                                    (copy-sequence tags)))
+                (tags (cl-remove-if #'miniflux--feed-tag-p tags)))
+           (when (and api-cat (not (memq api-cat tags)))
+             (push api-cat tags))
+           (when (and api-feed (not (memq api-feed tags)))
+             (push api-feed tags))
+           (setf (elfeed-entry-meta e)
+                 (miniflux--plist-merge
+                  (miniflux--entry-meta api-entry
+                                        (or (assoc-default 'author api-entry) ""))
+                  (elfeed-entry-meta e)))
+           (setf (elfeed-entry-tags e) tags)))))
    api-table))
 
 (defun miniflux-sync (&optional callback)
@@ -1226,6 +1292,8 @@ finishes, so Emacs stays responsive."
 (defun miniflux--setup-keybindings ()
   "Set up keybindings for Miniflux integration in elfeed modes."
   (with-eval-after-load 'elfeed-search
+    (advice-add 'elfeed-search--column-tags
+                :around #'miniflux--search-column-tags)
     (define-key elfeed-search-mode-map "G" #'miniflux-search-refresh)
     (define-key elfeed-search-mode-map "M" #'miniflux-mark-current-feed-read)
     (define-key elfeed-search-mode-map "O" #'miniflux-open-entry-in-miniflux)

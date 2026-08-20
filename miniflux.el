@@ -1298,8 +1298,8 @@ finishes, so Emacs stays responsive."
     (define-key elfeed-search-mode-map "M" #'miniflux-mark-current-feed-read)
     (define-key elfeed-search-mode-map "O" #'miniflux-open-entry-in-miniflux)
     (define-key elfeed-search-mode-map "R" #'miniflux-retry-sync-failed)
-    (when (fboundp 'evil-define-key)
-      (evil-define-key 'normal elfeed-search-mode-map
+    (when (fboundp 'evil-define-key*)
+      (evil-define-key* 'normal elfeed-search-mode-map
         "G" #'miniflux-search-refresh
         "M" #'miniflux-mark-current-feed-read
         "O" #'miniflux-open-entry-in-miniflux
